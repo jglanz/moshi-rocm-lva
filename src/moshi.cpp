@@ -786,14 +786,21 @@ struct moshi_lm_gen_t {
     own_ptr<WeightLoader> voice_weights;
 
     moshi_lmgen_t lmgen;
-    StateMachine * machine;
-    State * machine_state;
-    StateContext * state_ctx;
-    ScratchContext * ctx;
+    // Owned by this generator, all six, and all allocated in moshi_lm_start.
+    //
+    // The NSDMIs are load-bearing, not tidiness: moshi_lm_generator does
+    // `new moshi_lm_gen_t` (default-init), so without them these are indeterminate
+    // between the generator being created and moshi_lm_start filling them in --
+    // and unref() now dereferences them. A caller that allocates a generator and
+    // then fails before starting it is an ordinary path, not a bug.
+    StateMachine * machine = NULL;
+    State * machine_state = NULL;
+    StateContext * state_ctx = NULL;
+    ScratchContext * ctx = NULL;
     std::vector<int> audio_tokens;
 
-    moshi_lmmodel_states_t * lm_states;
-    moshi_lmgen_state_t * lmgen_state;
+    moshi_lmmodel_states_t * lm_states = NULL;
+    moshi_lmgen_state_t * lmgen_state = NULL;
 
     // One-shot injection slot handed to moshi_lmgen_t on the personaplex path.
     // -1 == nothing armed. Atomic because it is armed from the caller's thread and
@@ -809,6 +816,28 @@ moshi_lm_gen_t * moshi_lm_generator( moshi_lm_t * lm ) {
 }
 
 void unref( moshi_lm_gen_t * gen ) {
+    if ( ! gen )
+        return;
+    // `delete gen` alone leaks every one of these: they are raw pointers to
+    // heap objects this generator owns, and two of them -- state_ctx and ctx --
+    // each hold a ggml_backend_buffer_t of DEVICE memory. Their destructors are
+    // correct and were simply never reached.
+    //
+    // Measured before this change, one PersonaPlex-7B bf16 session on a 20 GiB
+    // gfx1100: idle 25 MiB -> session resident 18987 MiB -> 3481 MiB fifteen
+    // seconds after teardown. 3.46 GiB stranded per session, so the second
+    // session in a process cannot allocate and ggml answers that with
+    // GGML_ASSERT -> abort().
+    //
+    // Reverse allocation order: lm_states holds tensors living in state_ctx, so
+    // state_ctx goes last. Nothing here reads another's memory during teardown --
+    // the order is defensive, not required.
+    delete gen->lmgen_state;
+    delete gen->lm_states;
+    delete gen->machine_state;
+    delete gen->machine;
+    delete gen->ctx;
+    delete gen->state_ctx;
     delete gen;
 }
 

@@ -433,6 +433,14 @@ struct moshi_lmmodel_states_t {
     GraphContext * depformer_gctx = NULL;
     lmmodel_depformer_embed_t depformer_embed;
     ggml_tensor * depformer_tokens;
+
+    // Both GraphContexts are owned here and each holds a ggml_backend_buffer_t.
+    // ~GraphContext frees it correctly; nothing was calling it, so every
+    // generator teardown stranded the two compute buffers along with the state.
+    ~moshi_lmmodel_states_t() {
+        delete depformer_gctx;
+        delete gctx;
+    }
 };
 
 moshi_lmmodel_states_t * moshi_lmmodel_states( StateContext * state_ctx,
@@ -785,6 +793,9 @@ moshi_lmgen_state_t * moshi_lmgen_state( moshi_lmmodel_t * lm ) {
 }
 
 struct voice_t {
+    // Both raw and both OURS: moshi_lm_personaplex_load_voice ggml_init()s the
+    // context and ggml_backend_alloc_ctx_tensors() the buffer into it. Every
+    // construction site NULLs them first, so the destructor's guards are real.
     ggml_context * ctx;
     ggml_backend_buffer * buffer;
     ggml_tensor * sum;
@@ -795,6 +806,13 @@ struct voice_t {
     ggml_tensor * prompt_embeddings;
     ggml_tensor * prompt_cache;
     std::vector<int> text_prompt_tokens;
+
+    ~voice_t() {
+        if ( buffer )
+            ggml_backend_buffer_free( buffer );
+        if ( ctx )
+            ggml_free( ctx );
+    }
 };
 
 // ---------------------------------------------------------------------------
