@@ -531,6 +531,15 @@ void moshi_lmmodel_depformer_step(
                 last_token_input,
                 state->transformer_out );
 
+            // NOT teacher-forced, unlike the reference's graphed_depth, which takes
+            // target_/provided_ and substitutes a supplied token for the sampled one
+            // at each codebook. That is safe HERE and only here: this chain runs
+            // codebooks in order, and on personaplex every supplied codebook (the
+            // user's eight) sits above every generated one (moshi's eight), so no
+            // supplied value would ever have entered the chain before the generated
+            // ones were produced. A model whose supplied codebooks interleaved with
+            // its generated ones would need this forced, and the graph would have to
+            // grow a per-codebook input slot to allow it.
             next_token = moshi_sample_token( ctx, logits, use_sampling, temp, top_k );
             view = ggml_view_1d( ctx, view, 1, 4 );
             ctx.build_forward_expand( ggml_cpy( ctx, next_token, view ) );
@@ -727,6 +736,11 @@ struct moshi_lmgen_state_t {
     int offset;
     int skip;
     std::vector<std::vector<int>> cache;
+    // Parallel to `cache`: was this slot's value SUPPLIED by the caller rather than
+    // sampled by the model? Without it the depformer's own prediction of the user's
+    // audio overwrites the user's actual audio in seven of its eight codebooks every
+    // frame -- see moshi_lmgen_commit.
+    std::vector<std::vector<char>> provided;
     std::vector<int> initial;
 };
 
@@ -739,17 +753,30 @@ moshi_lmgen_state_t * moshi_lmgen_state( moshi_lmmodel_t * lm ) {
     if ( lm->personaplex )
         cache_capacity += 1;
     state->cache.resize( cache_capacity );
+    state->provided.resize( cache_capacity );
     for (int c = 0; c < cache_capacity; c++) {
         auto & cache = state->cache[c];
         cache.resize( lm->num_codebooks );
         for (int k = 0; k < lm->num_codebooks; k++) {
             cache[k] = lm_ungenerated_token_id;
         }
+        state->provided[c].assign( lm->num_codebooks, 0 );
     }
     state->initial.resize( lm->num_codebooks );
     state->initial[0] = lm->text_initial_token_id;
     for ( int i = 1; i < lm->num_codebooks; i++ )
         state->initial[i] = lm->initial_token_id;
+    // The reference has a step at offset 0 that seeds SLOT 0 ONLY with the initial
+    // tokens and returns nothing (LMGen.prepare_step_input's `offset == 0` branch,
+    // `state.cache[:, :, 0] = state.initial[:, :, 0]`). This port has no such step --
+    // its offset counter is the reference's minus one -- so that one slot is seeded
+    // here instead, and the first real step reads it as its input exactly as the
+    // reference's step 1 does. Every OTHER slot stays at lm_ungenerated_token_id,
+    // which is deliberate: the delay pipeline fills them, and a slot that is read
+    // before anything wrote it is a bug worth crashing on rather than a slot quietly
+    // holding a plausible token.
+    for ( int k = 0; k < lm->num_codebooks; k++ )
+        state->cache[0][k] = state->initial[k];
     return state;
 }
 
@@ -765,6 +792,108 @@ struct voice_t {
     ggml_tensor * prompt_cache;
     std::vector<int> text_prompt_tokens;
 };
+
+// ---------------------------------------------------------------------------
+// The cache/delay discipline, in one place.
+//
+// Every step of this model -- the conversation steps and the system-prompt steps
+// alike -- has to agree about four things: where a caller-supplied token lands in
+// the delay pipeline, which slot the network reads, which slot the results go to,
+// and when the offset advances. The reference implements that once, in
+// LMGen.prepare_step_input / process_transformer_output
+// (NVIDIA/personaplex moshi/models/lm.py). This port had implemented it three times
+// -- once in moshi_lmgen_step and once in each prompt stepper -- and the three did
+// not agree. These helpers are the single copy; all three sites call them.
+//
+// OFFSET CONVENTION. This port's `state->offset` is the reference's offset MINUS
+// ONE: where the reference reads cache[P-1], writes results at cache[P] and then
+// advances, this port reads cache[O], writes at cache[O+1] and then advances. Every
+// index below is the reference's formula with P = O + 1 already substituted, which
+// is why the provided-token write is at offset + 1 + delays[k] and not at
+// offset + delays[k].
+//
+// The reference's offset-0 step -- the one that seeds slot 0 and returns None -- has
+// no counterpart here, and that is what the minus-one convention IS: this port's
+// step O does the work of the reference's step O+1, so the reference's step 0 has
+// nothing to do and is folded into moshi_lmgen_state()'s slot-0 seeding. A reader
+// comparing step counts between the two will find this port one short, and that is
+// the reason.
+
+inline int moshi_lmgen_input_position( moshi_lmgen_state_t * state ) {
+    return state->offset % (int) state->cache.size();
+}
+
+inline int moshi_lmgen_target_position( moshi_lmgen_state_t * state ) {
+    return ( state->offset + 1 ) % (int) state->cache.size();
+}
+
+// Supply a token for codebook `k`. It enters the delay pipeline at that codebook's
+// own delay, and is FORCED rather than sampled when its step comes round.
+inline void moshi_lmgen_provide( moshi_lmgen_state_t * state, moshi_lmmodel_t * lm,
+                                 int k, int value ) {
+    const int CT = (int) state->cache.size();
+    const int position = ( state->offset + 1 + lm->delays[k] ) % CT;
+    state->cache[position][k] = value;
+    state->provided[position][k] = 1;
+}
+
+// Codebooks still inside their own delay window have no generated value to offer
+// yet, so the initial token stands in for them (reference: the `offset <= delay`
+// loop in prepare_step_input).
+inline void moshi_lmgen_provide_initial( moshi_lmgen_state_t * state,
+                                         moshi_lmmodel_t * lm ) {
+    const int target = moshi_lmgen_target_position( state );
+    for ( int k = 0; k < lm->num_codebooks; k++ ) {
+        if ( state->offset < lm->delays[k] ) {
+            state->cache[target][k] = state->initial[k];
+            state->provided[target][k] = 1;
+        }
+    }
+}
+
+inline void moshi_lmgen_read_input( moshi_lmgen_state_t * state, moshi_lmmodel_t * lm,
+                                    std::vector<int> & input ) {
+    const int position = moshi_lmgen_input_position( state );
+    input.resize( lm->num_codebooks );
+    for ( int k = 0; k < lm->num_codebooks; k++ ) {
+        input[k] = state->cache[position][k];
+    }
+}
+
+// The text token this step actually conditions on: the supplied one when there is
+// one, otherwise what the sampler produced.
+inline int moshi_lmgen_next_text_token( moshi_lmgen_state_t * state, int sampled ) {
+    const int target = moshi_lmgen_target_position( state );
+    return state->provided[target][0] ? state->cache[target][0] : sampled;
+}
+
+// Commit a step: sampled values fill the slots nobody supplied, supplied values are
+// left alone, the consumed input slot's flags are released, and the offset advances.
+//
+// "Supplied values are left alone" is the whole point. The depformer predicts all
+// dep_q codebooks, including the ones carrying the USER's audio -- that is what
+// full-duplex training asks of it -- and at inference the user's real audio has to
+// win. Writing the depformer's output unconditionally replaced seven of the eight
+// user codebooks with the model's guess at what the user was about to say, every
+// frame, and the model then conditioned on its own guess.
+inline void moshi_lmgen_commit( moshi_lmgen_state_t * state, moshi_lmmodel_t * lm,
+                                int sampled_text,
+                                const std::vector<int> & sampled_audio ) {
+    const int input_position  = moshi_lmgen_input_position( state );
+    const int target = moshi_lmgen_target_position( state );
+    if ( ! state->provided[target][0] ) {
+        state->cache[target][0] = sampled_text;
+    }
+    for ( int q = 0; q < (int) sampled_audio.size() && q + 1 < lm->num_codebooks; q++ ) {
+        if ( ! state->provided[target][q + 1] ) {
+            state->cache[target][q + 1] = sampled_audio[q];
+        }
+    }
+    for ( int k = 0; k < lm->num_codebooks; k++ ) {
+        state->provided[input_position][k] = 0;
+    }
+    state->offset++;
+}
 
 struct moshi_lmgen_t {
     moshi_lmmodel_t * lm;
@@ -832,10 +961,32 @@ bool moshi_lmgen_step(
         assert( (int)lm->delays.size() >= needed_tokens );
         int start = dep_q_1;
         for ( int i = 0; i < needed_tokens; i++ ) {
-            int write_position = (state->offset + lm->delays[start + i]) % CT;
-            state->cache[write_position][start + i] = int_audio_tokens[i];
+            // Through the shared discipline, which puts this one slot later than the
+            // hand-rolled write it replaces -- see the offset convention note there.
+            moshi_lmgen_provide( state, lm, start + i, int_audio_tokens[i] );
         }
     }
+
+    // Arm an injected text token the same way the reference does -- as a PROVIDED
+    // token in the delay pipeline (LMGen.step's `text_token=` argument), not as a
+    // post-sampling patch. delays[0] is 0, so it lands on this step's target slot and
+    // takes effect immediately, exactly as before; routing it here means the forcing
+    // rule lives in one place and the injected token reaches the cache the same way
+    // every other supplied token does.
+    if ( forced_text_token ) {
+        const int forced = forced_text_token->exchange( -1, std::memory_order_acq_rel );
+        if ( forced >= 0 ) {
+            moshi_lmgen_provide( state, lm, 0, forced );
+        }
+    }
+
+    // Initial-token fill LAST, after every caller-supplied token, mirroring
+    // prepare_step_input's own order. On this model the order cannot matter -- a
+    // codebook inside its delay window and a codebook the caller supplies are
+    // disjoint sets here, because delays[0] is 0 so the text stream is never inside
+    // one -- but that is an accident of these delays, not a property of the
+    // algorithm, and matching the reference costs nothing.
+    moshi_lmgen_provide_initial( state, lm );
     /*
     it would possibly make sense to "warm up" the cache to avoid the branching
     logic below, and maybe have a more complete graph. may not be a performance
@@ -844,15 +995,8 @@ bool moshi_lmgen_step(
     for -1 and zeroes out the results if present. that means to do that you
     need to modify data. see: scaled_embedding functions
     */
-    int positions = state->offset % CT;
-    std::vector<int> input( lm->num_codebooks );
-    for ( int i = 0; i < lm->num_codebooks; i++ ) {
-        auto is_init = state->offset <= lm->delays[i];
-        if (is_init)
-            input[i] = state->initial[i];
-        else
-            input[i] = state->cache[positions][i];
-    }
+    std::vector<int> input;
+    moshi_lmgen_read_input( state, lm, input );
 
     ONCE( scratch.set_name("text") );
     ON_NTH( 32, scratch.set_name( "text_32" ) );
@@ -898,32 +1042,12 @@ bool moshi_lmgen_step(
     ggml_backend_tensor_get( lm_states->sampler_out, &text_token, 0, 4 );
 #endif
 
-    // personaplex text-token injection.
-    //
-    // `text_token` has just been read back from the live sampler above, and
-    // moshi_lmmodel_depformer_step() below consumes it to produce this frame's
-    // audio codes. Overriding it HERE -- after the sample, strictly before the
-    // depformer -- is what makes the model SPEAK the injected token rather than
-    // merely report it: the audio heads condition on the text token.
-    //
-    // The on_text_hook immediately below cannot be reused for this. It is guarded
-    // by `machine`, and moshi_lm_start() constructs a personaplex generator with
-    // machine == NULL and NULL prefix deques, so that whole block is dead on the
-    // personaplex path.
-    //
-    // The slot is ONE SHOT: the caller arms it before each step and the step
-    // consumes it, so a stale forcing cannot leak into a later frame. Note that
-    // every call consumes it, including the ones that return false -- forcing
-    // happens at sampling time, while the caller observes tokens delay-compensated
-    // out of state->cache further down, max_delay - delays[0] frames later.
-    if ( forced_text_token ) {
-        // exchange, not load-then-store: consuming the slot has to be one
-        // indivisible step or a token armed between the two halves is dropped.
-        const int forced = forced_text_token->exchange( -1, std::memory_order_acq_rel );
-        if ( forced >= 0 ) {
-            text_token = forced;
-        }
-    }
+    // The SAMPLED token, kept separate from the one this step conditions on: the
+    // cache records what the model produced, the depformer consumes what was
+    // supplied when something was (reference: `sampled_text_token` vs
+    // `next_text_token` in process_transformer_output).
+    const int sampled_text_token = text_token;
+    text_token = moshi_lmgen_next_text_token( state, sampled_text_token );
 
     // on_text_hook
     if ( machine ) {
@@ -977,15 +1101,29 @@ bool moshi_lmgen_step(
         }
     }
 
-    state->offset++;
+    // WHAT THE CACHE MUST RECORD is the text token this step actually conditioned the
+    // depformer on -- the monologue as it was spoken -- because the cache IS the
+    // model's account of its own turn: every later step attends to it, and
+    // moshi_lm_receive reads the emitted text token straight back out of it.
+    //
+    // Without a state machine `text_token` IS `sampled_text_token` (the only other
+    // writer is moshi_lmgen_next_text_token, and a SUPPLIED token is already in the
+    // slot -- moshi_lmgen_commit leaves any slot whose `provided` flag is set exactly
+    // as the caller wrote it). So for every PersonaPlex generator this is identical to
+    // what it replaced, token for token: moshi_lm_start only builds a StateMachine on
+    // the non-personaplex voice path.
+    //
+    // WITH a state machine the two diverge, and that is the bug this replaces. The
+    // machine rewrites the token -- padding discipline, word starts, and the
+    // text_prefixes it splices for a scripted voice -- and the depformer voices the
+    // REWRITE, one line above. Committing the sampler's token instead left the model
+    // conditioned on a monologue it never spoke and could not see, and the tap read
+    // that phantom stream back out. The reference mutates its `text_token` tensor
+    // in place inside the on_text hook and then caches THAT tensor, which is this.
+    const int committed_text_token = machine ? text_token : sampled_text_token;
+    moshi_lmgen_commit( state, lm, committed_text_token,
+        lm->depformer ? int_audio_tokens : std::vector<int>() );
 
-    int position = state->offset % CT;
-    state->cache[position][0] = text_token;
-    if ( lm->depformer ) {
-        for (int q = 0; q < (int)int_audio_tokens.size(); q++) {
-            state->cache[position][q + 1] = int_audio_tokens[q];
-        }
-    }
     
     if ( state->skip > 0 ) {
         --state->skip;
@@ -1033,33 +1171,28 @@ std::vector<int> SINE_TOKENS    = { 430, 1268, 381, 1611, 1095, 1495, 56, 472 };
 // Both SILENCE_TOKENS and SINE_TOKENS are exactly that wide.
 const int PERSONAPLEX_TOKENS_PER_STREAM = 8;
 
-// Fill the audio half of a system-prompt step's input: silence on the moshi
-// stream, and NOTHING on the user stream.
+// Supply a system-prompt step's audio: silence on the moshi stream, sine on the
+// user stream, both through the shared delay pipeline.
 //
-// SINE_TOKENS IS DELIBERATELY NOT APPLIED HERE, and the reason is a real structural
-// difference from the reference rather than an oversight.
-//
-// The reference passes moshi_tokens=SILENCE_TOKENS *and* input_tokens=SINE_TOKENS to
-// every system-prompt step (LMGen._step_audio_silence_core, _step_text_prompt_core).
-// But it does not feed them to the step directly: prepare_step_input() writes each
-// provided token into state.cache at (offset + delays[k]) and the step's model input
-// is cache[:, :, offset - 1], so a token "provided at step S" reaches the network
-// through the delay pipeline. THESE steppers bypass that pipeline entirely -- they
-// build `input` and hand it straight to moshi_lmmodel_forward_text() for step S, and
-// write the cache at `offset` with no delay applied.
-//
-// Adding the sine to a pipeline that is already a step out of phase makes the prefix
-// worse, not better, and measurably so. Measured on the M3 parity fixture (NATF0,
-// the M2 persona prompt, the M2 user turn): WITH the sine the model interrupts the
-// user 320 ms in with "Hey, let me know" and then falls silent for the rest of the
-// window; WITHOUT it, it waits for the user to finish and answers on returned frame
-// 126 against the reference's 127, with a near-identical token stream. So the user
-// half of the prompt is left alone until the steppers themselves are rewritten to go
-// through the cache the way the reference does.
-void moshi_lmgen_fill_prompt_audio( moshi_lmmodel_t * lm, std::vector<int> & input ) {
+// SINE_TOKENS IS APPLIED HERE NOW, and the history is worth keeping because it is a
+// good example of a fix that looks obvious and is not. The reference passes
+// moshi_tokens=SILENCE_TOKENS *and* input_tokens=SINE_TOKENS to every system-prompt
+// step (LMGen._step_audio_silence_core, _step_text_prompt_core), while this port
+// declared SINE_TOKENS and never read it. Applying it while the steppers still had
+// their own broken cache discipline made the model INTERRUPT the user 320 ms in with
+// "Hey, let me know" and then fall silent -- worse than leaving it out, which is why
+// an earlier revision of this series deliberately left it out and said so. With the
+// steppers going through moshi_lmgen_provide() the phase error is gone and the sine
+// is simply what the reference does.
+void moshi_lmgen_provide_prompt_audio( moshi_lmgen_state_t * state,
+                                       moshi_lmmodel_t * lm ) {
     const int per_stream = PERSONAPLEX_TOKENS_PER_STREAM;
     for ( int i = 0; i < per_stream && i < lm->num_audio_codebooks; i++ ) {
-        input[i + lm->audio_offset] = SILENCE_TOKENS[i];
+        moshi_lmgen_provide( state, lm, i + lm->audio_offset, SILENCE_TOKENS[i] );
+    }
+    for ( int i = 0; i < per_stream && per_stream + i < lm->num_audio_codebooks; i++ ) {
+        moshi_lmgen_provide( state, lm, i + lm->audio_offset + per_stream,
+            SINE_TOKENS[i] );
     }
 }
 
@@ -1079,7 +1212,30 @@ void moshi_lmgen_step_voice_prompt(
         auto top_k = lmgen->top_k;
         auto top_k_text = lmgen->top_k_text;
         std::vector<int> int_audio_tokens( lmgen->lm->dep_q );
+        auto lm = lmgen->lm;
         for ( int i = 0; i < voice->prompt_embeddings->ne[3]; i++ ) {
+            // The reference replays a stored voice prompt through the SAME
+            // bookkeeping every other step uses: LMGen.step_embeddings() calls
+            // prepare_step_input() with the initial token on every audio codebook
+            // and zero_text_code on the text stream, uses only its provided/target
+            // outputs, and then runs the transformer on the embedding instead of on
+            // the token input. That is what this reproduces.
+            //
+            // Skipping it -- which is what a bare offset++ here amounts to -- does
+            // not just lose bookkeeping for these frames. It leaves the `provided`
+            // mask EMPTY going into the first silence step, where the reference has
+            // it set for the 14 delay-1 codebooks; the reference forces those slots
+            // out of the restored voice cache and this port sampled them instead.
+            moshi_lmgen_provide( state, lm, 0, lm->text_padding_token_id );
+            for ( int k = 1; k < lm->num_codebooks; k++ ) {
+                // _get_initial_token() for every audio codebook. The reference
+                // splits it across input_tokens/moshi_tokens, which lands the two
+                // halves on each other's streams; that is invisible because
+                // state->initial is the same value for every audio codebook.
+                moshi_lmgen_provide( state, lm, k, state->initial[k] );
+            }
+            moshi_lmgen_provide_initial( state, lm );
+
             auto input = ggml_view_4d( scratch, voice->prompt_embeddings,
                 voice->prompt_embeddings->ne[0],
                 voice->prompt_embeddings->ne[1],
@@ -1098,20 +1254,26 @@ void moshi_lmgen_step_voice_prompt(
                 scratch_transformer_out, lm_states->transformer_out );
             scratch.build_forward_expand( cpy_transformer_out );
 
-            // note this does the compute
-            auto text_token = moshi_sample_token_int( scratch, text_logits,
+            // This call also DRIVES THE COMPUTE for the transformer copy above; it
+            // is not a wasted sample, and deleting it breaks the step.
+            const int sampled_text_token = moshi_sample_token_int( scratch, text_logits,
                 use_sampling, temp_text, top_k_text );
-
-            text_token = lmgen->lm->text_padding_token_id;
+            const int text_token = moshi_lmgen_next_text_token( state, sampled_text_token );
 
             moshi_lmmodel_depformer_step(
-                scratch, lmgen->lm, lm_states,
+                scratch, lm, lm_states,
                 text_token, use_sampling, temp, top_k,
                 int_audio_tokens );
 
-            state->offset++;
+            moshi_lmgen_commit( state, lm, sampled_text_token, int_audio_tokens );
         }
 
+        // The stored cache is restored over the VALUES only, exactly as the
+        // reference's `state.cache.copy_(self.voice_prompt_cache)` does -- it touches
+        // cache and not provided. The flags the last replayed step left behind are
+        // therefore live, and they are what makes the first silence step force its
+        // delay-1 codebooks out of this restored cache instead of sampling them.
+        //
         // note that dimensions inverted
         assert( voice->prompt_cache->type == GGML_TYPE_I32 );
         int cache_height = (int)state->cache.size(); // time
@@ -1130,37 +1292,7 @@ void moshi_lmgen_step_voice_prompt(
     }
 }
 
-void moshi_lmgen_step_text_prompt(
-    ScratchContext & scratch,
-    moshi_lmgen_t * lmgen,
-    moshi_lmgen_state_t * state,
-    moshi_lmmodel_states_t * lm_states
-) {
-    auto lm = lmgen->lm;
-    auto use_sampling = lmgen->use_sampling;
-    auto temp = lmgen->temp;
-    auto temp_text = lmgen->temp_text;
-    auto top_k = lmgen->top_k;
-    auto top_k_text = lmgen->top_k_text;
-
-    // Get text prompt tokens from voice (set via moshi_lm_personaplex_set_text_prompt)
-    std::vector<int> * prompt_tokens = NULL;
-    if ( lmgen->text_prefixes ) {
-        // For TTS voice path (not used for personaplex)
-    }
-    // Check voice text_prompt_tokens via the lm_states route - we need to pass them in
-    // For now, use the tokens stored in the voice struct via system_prompts caller
-
-    // Build input sequence: text_token + SILENCE audio tokens
-    std::vector<int> int_audio_tokens( lm->dep_q );
-    const int CT = (int) state->cache.size();
-
-    // The text prompt tokens should have been set before calling this
-    // Access them through the voice struct via the caller (moshi_lmgen_step_system_prompts)
-    // This function receives tokens via the extended signature below
-}
-
-// Internal version with token list
+// Teacher-force the tokenized system text prompt.
 void moshi_lmgen_step_text_prompt_tokens(
     ScratchContext & scratch,
     moshi_lmgen_t * lmgen,
@@ -1178,15 +1310,17 @@ void moshi_lmgen_step_text_prompt_tokens(
     auto top_k = lmgen->top_k;
     auto top_k_text = lmgen->top_k_text;
     std::vector<int> int_audio_tokens( lm->dep_q );
-    const int CT = (int) state->cache.size();
 
     for ( int t = 0; t < (int)tokens.size(); t++ ) {
-        // Build input: text token from prompt, silence on the moshi stream, and
-        // the user stream left alone -- see moshi_lmgen_fill_prompt_audio for why
-        // the reference's SINE_TOKENS are deliberately not applied here.
-        std::vector<int> input( lm->num_codebooks );
-        input[0] = tokens[t];
-        moshi_lmgen_fill_prompt_audio( lm, input );
+        // Supply this step: the prompt token on the text stream, silence on the
+        // moshi stream, sine on the user stream -- all through the shared pipeline,
+        // so the network reads them at the same slots moshi_lmgen_step would.
+        moshi_lmgen_provide( state, lm, 0, tokens[t] );
+        moshi_lmgen_provide_prompt_audio( state, lm );
+        moshi_lmgen_provide_initial( state, lm );
+
+        std::vector<int> input;
+        moshi_lmgen_read_input( state, lm, input );
 
         auto [scratch_transformer_out, text_logits] = moshi_lmmodel_forward_text(
             scratch, lm, lm_states, input, NULL );
@@ -1195,22 +1329,20 @@ void moshi_lmgen_step_text_prompt_tokens(
             scratch_transformer_out, lm_states->transformer_out );
         scratch.build_forward_expand( cpy_transformer_out );
 
-        // Sample but override to padding token (model is being conditioned, not generating)
-        auto text_token = moshi_sample_token_int( scratch, text_logits,
+        // The sample is kept -- it is what the cache records for an unsupplied slot
+        // -- while the depformer conditions on the supplied prompt token. Note this
+        // call also DRIVES THE COMPUTE for the transformer copy above; it is not a
+        // wasted sample, and deleting it breaks the step.
+        const int sampled_text_token = moshi_sample_token_int( scratch, text_logits,
             use_sampling, temp_text, top_k_text );
-        text_token = lm->text_padding_token_id; // force padding
+        const int text_token = moshi_lmgen_next_text_token( state, sampled_text_token );
 
         moshi_lmmodel_depformer_step(
             scratch, lm, lm_states,
             text_token, use_sampling, temp, top_k,
             int_audio_tokens );
 
-        int position = state->offset % CT;
-        state->cache[position][0] = text_token;
-        for ( int q = 0; q < (int)int_audio_tokens.size(); q++ ) {
-            state->cache[position][q + 1] = int_audio_tokens[q];
-        }
-        state->offset++;
+        moshi_lmgen_commit( state, lm, sampled_text_token, int_audio_tokens );
     }
 }
 
@@ -1228,14 +1360,14 @@ void moshi_lmgen_step_audio_silence(
     auto top_k = lmgen->top_k;
     auto top_k_text = lmgen->top_k_text;
     std::vector<int> int_audio_tokens( lm->dep_q );
-    const int CT = (int) state->cache.size();
 
     for ( int i = 0; i < n_steps; i++ ) {
-        // Build input: padding text token, silence on the moshi stream, and the
-        // user stream left alone -- see moshi_lmgen_fill_prompt_audio.
-        std::vector<int> input( lm->num_codebooks );
-        input[0] = lm->text_padding_token_id; // text padding token
-        moshi_lmgen_fill_prompt_audio( lm, input );
+        moshi_lmgen_provide( state, lm, 0, lm->text_padding_token_id );
+        moshi_lmgen_provide_prompt_audio( state, lm );
+        moshi_lmgen_provide_initial( state, lm );
+
+        std::vector<int> input;
+        moshi_lmgen_read_input( state, lm, input );
 
         auto [scratch_transformer_out, text_logits] = moshi_lmmodel_forward_text(
             scratch, lm, lm_states, input, NULL );
@@ -1244,21 +1376,16 @@ void moshi_lmgen_step_audio_silence(
             scratch_transformer_out, lm_states->transformer_out );
         scratch.build_forward_expand( cpy_transformer_out );
 
-        auto text_token = moshi_sample_token_int( scratch, text_logits,
+        const int sampled_text_token = moshi_sample_token_int( scratch, text_logits,
             use_sampling, temp_text, top_k_text );
-        text_token = lm->text_padding_token_id; // force padding
+        const int text_token = moshi_lmgen_next_text_token( state, sampled_text_token );
 
         moshi_lmmodel_depformer_step(
             scratch, lm, lm_states,
             text_token, use_sampling, temp, top_k,
             int_audio_tokens );
 
-        int position = state->offset % CT;
-        state->cache[position][0] = text_token;
-        for ( int q = 0; q < (int)int_audio_tokens.size(); q++ ) {
-            state->cache[position][q + 1] = int_audio_tokens[q];
-        }
-        state->offset++;
+        moshi_lmgen_commit( state, lm, sampled_text_token, int_audio_tokens );
     }
 }
 
