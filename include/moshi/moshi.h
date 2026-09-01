@@ -219,6 +219,16 @@ MOSHI_API int moshi_lm_personaplex_get_text_prompt_tokens( moshi_lm_gen_t * gen,
 // default (LMGen.audio_silence_frame_cnt); the prefix only agrees with the
 // reference token for token at that value.
 MOSHI_API void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_temperature, float text_temperature, bool logging = false, int audio_silence_frames = 1 );
+
+// Put a started generator back to a virgin conversation WITHOUT reallocating any of
+// its state: the delay cache, the state tensors, the streaming states and the
+// injection slot are re-seeded in place and the system-prompt phase runs again with
+// whatever voice / text prompt is currently set. Allocates nothing, frees nothing.
+//
+// This is what a resident server calls between connections instead of destroying
+// the generator -- see the comment on moshi_lm_prime in moshi.cpp for why reuse
+// rather than free is the design.
+MOSHI_API void moshi_lm_reset( moshi_context_t * moshi, moshi_lm_gen_t * gen, int audio_silence_frames = 0 );
 // Personaplex mid-conversation text-token injection. Arm the slot with the token
 // this frame must emit, then call moshi_lm_receive/moshi_lm_receive2: the step
 // overrides the sampled text token with it BEFORE the depformer runs, so the audio

@@ -209,6 +209,14 @@ void mimi_encode_reset( mimi_encode_context_t * context ) {
     auto scratch = context->codec->moshi->scratch.ptr;
     auto mimi = context->codec->mimi.ptr;
     auto states = context->states.ptr;
+    // state_ctx->init() FIRST, and it is not optional. init() below re-seeds the
+    // two transformers' offsets and attention state, but the SEANet conv streaming
+    // history lives as tensors in this context's StateContext and only
+    // StateContext::init() puts those back. Without it a "reset" encoder carries
+    // the previous stream's tail, and the same audio encodes to different codes --
+    // which is exactly how this was found: a parity pass repeated after a reset
+    // decoded a completely different token stream.
+    context->state_ctx->init();
     init( scratch, states, mimi );
 }
 
@@ -267,6 +275,9 @@ void mimi_decode_reset( mimi_decode_context_t * context ) {
     auto scratch = context->codec->moshi->scratch.ptr;
     auto mimi = context->codec->mimi.ptr;
     auto states = context->states.ptr;
+    // See mimi_encode_reset: the conv streaming history needs StateContext::init(),
+    // init() alone does not reach it.
+    context->state_ctx->init();
     init( scratch, states, mimi );
 }
 
@@ -980,6 +991,8 @@ int moshi_lm_personaplex_get_text_prompt_tokens( moshi_lm_gen_t * gen, std::vect
     return (int) tokens.size();
 }
 
+void moshi_lm_prime( moshi_context_t * moshi, moshi_lm_gen_t * gen, int audio_silence_frames );
+
 void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_temperature, float text_temperature, bool logging, int audio_silence_frames ) {
     const int max_padding = 8;
     const int initial_padding = 2;
@@ -1015,11 +1028,42 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
     }
     gen->lmgen_state = moshi_lmgen_state( gen->lm->model );
     gen->state_ctx->alloc();
-    gen->state_ctx->init();
-    init( moshi->scratch, gen->lm_states, gen->lm->model, condition_cross );
 
     gen->ctx = new ScratchContext( 256, moshi->backend );
     gen->audio_tokens.resize( gen->lm->model->num_audio_codebooks );
+
+    moshi_lm_prime( moshi, gen, audio_silence_frames );
+}
+
+// The PRIME half of moshi_lm_start: put the generator back to the state a fresh
+// conversation starts from, touching only things that already exist.
+//
+// WHY THIS IS SPLIT OUT -- REUSE OVER FREE. A server that holds a model resident
+// and serves one conversation at a time used to destroy the generator between
+// connections and build a new one. That is a free/alloc cycle of the KV cache, the
+// state context and the compiled compute graphs on every reconnect, and on a card
+// sized for exactly one session it does not survive the second one: the freed
+// blocks come back fragmented and a ~794 MiB graph allocation fails, which ggml
+// answers with GGML_ASSERT -> abort().
+//
+// Resetting instead allocates nothing and frees nothing. The arena is paid for once
+// and reused for the life of the process, so the per-connection memory delta is
+// zero by construction rather than by getting every destructor right.
+//
+// Everything conversational is re-seeded here: the delay-cache ring and its
+// `provided` masks, the offset, the state tensors (state_ctx->init() rewrites them
+// from the saved initial data), the model's streaming states, the one-shot
+// injection slot, and finally the system-prompt phase -- which picks up whatever
+// voice and text prompt the caller has set since, so a new conversation gets its
+// own persona rather than the previous one's.
+void moshi_lm_prime( moshi_context_t * moshi, moshi_lm_gen_t * gen, int audio_silence_frames ) {
+    ggml_tensor * condition_cross =
+        ( gen->voice && ! gen->lm->model->personaplex ) ? gen->voice->cross : NULL;
+
+    gen->personaplex_forced_text_token.store( -1, std::memory_order_release );
+    moshi_lmgen_state_seed( gen->lmgen_state, gen->lm->model );
+    gen->state_ctx->init();
+    init( moshi->scratch, gen->lm_states, gen->lm->model, condition_cross );
 
     // personaplex process system prompts
     if ( gen->lm->model->personaplex ) {
@@ -1031,6 +1075,13 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
             audio_silence_frames
         );
     }
+}
+
+void moshi_lm_reset( moshi_context_t * moshi, moshi_lm_gen_t * gen, int audio_silence_frames ) {
+    // Only meaningful on a generator moshi_lm_start has already built.
+    if ( ! gen || ! gen->state_ctx || ! gen->lm_states || ! gen->lmgen_state || ! gen->ctx )
+        return;
+    moshi_lm_prime( moshi, gen, audio_silence_frames );
 }
 
 int moshi_lm_get_text_logits( moshi_lm_gen_t * gen, std::vector<float> & logits ) {

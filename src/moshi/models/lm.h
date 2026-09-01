@@ -756,11 +756,16 @@ struct moshi_lmgen_state_t {
     std::vector<int> initial;
 };
 
-moshi_lmgen_state_t * moshi_lmgen_state( moshi_lmmodel_t * lm ) {
-    auto state = new moshi_lmgen_state_t {
-        0, // offset
-        0, // skip
-    };
+// Put a generator state into its virgin condition, REUSING whatever storage it
+// already has: every resize/assign below is a no-op on a state that has run before,
+// so this allocates nothing and frees nothing.
+//
+// Factored out of moshi_lmgen_state so that the allocator and moshi_lm_reset cannot
+// drift apart -- a reset that seeds the cache differently from a fresh state is a
+// reset that leaks one conversation into the next, which is the whole hazard.
+void moshi_lmgen_state_seed( moshi_lmgen_state_t * state, moshi_lmmodel_t * lm ) {
+    state->offset = 0;
+    state->skip   = 0;
     int cache_capacity = lm->max_delay + 2;
     if ( lm->personaplex )
         cache_capacity += 1;
@@ -789,6 +794,11 @@ moshi_lmgen_state_t * moshi_lmgen_state( moshi_lmmodel_t * lm ) {
     // holding a plausible token.
     for ( int k = 0; k < lm->num_codebooks; k++ )
         state->cache[0][k] = state->initial[k];
+}
+
+moshi_lmgen_state_t * moshi_lmgen_state( moshi_lmmodel_t * lm ) {
+    auto state = new moshi_lmgen_state_t { 0, 0 };
+    moshi_lmgen_state_seed( state, lm );
     return state;
 }
 
