@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(Threads)
+find_dependency(ggml CONFIG)
+
+# SentencePiece has no CMake package config of its own; this helper re-creates the
+# moshi::sentencepiece imported target that moshi-targets.cmake refers to.
+include("${CMAKE_CURRENT_LIST_DIR}/moshi-sentencepiece.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/moshi-targets.cmake")
+
+check_required_components(moshi)
