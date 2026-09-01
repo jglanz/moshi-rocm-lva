@@ -228,7 +228,11 @@ MOSHI_API void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, fl
 // This is what a resident server calls between connections instead of destroying
 // the generator -- see the comment on moshi_lm_prime in moshi.cpp for why reuse
 // rather than free is the design.
-MOSHI_API void moshi_lm_reset( moshi_context_t * moshi, moshi_lm_gen_t * gen, int audio_silence_frames = 0 );
+// The default MATCHES moshi_lm_start's deliberately: a reset primes the generator
+// through the same prompt phase, so a different silence bracket here would mean a
+// reset generator was conditioned differently from a fresh one -- silently, and
+// only on the second conversation.
+MOSHI_API void moshi_lm_reset( moshi_context_t * moshi, moshi_lm_gen_t * gen, int audio_silence_frames = 1 );
 // Personaplex mid-conversation text-token injection. Arm the slot with the token
 // this frame must emit, then call moshi_lm_receive/moshi_lm_receive2: the step
 // overrides the sampled text token with it BEFORE the depformer runs, so the audio

@@ -420,6 +420,12 @@ struct moshi_lmmodel_states_t {
     own_ptr<moshi_streaming_transformer_state_t> transformer;
     own_ptr<moshi_streaming_transformer_state_t> depformer;
 
+    // The conversation path's own copy of transformer->graph, restored before every
+    // step. Counterpart to moshi_streaming_transformer_state_t::lazy_graph: the two
+    // disciplines share one live slot and each keeps its own view. See the comment
+    // there for what went wrong without it.
+    moshi_streaming_transformer_graph_t conv_graph;
+
     GraphContext * gctx = NULL;
     lmmodel_embed_t embed;
     int  transformer_T;
@@ -1070,9 +1076,14 @@ bool moshi_lmgen_step(
 
         graph.build_forward_expand( lm_states->sampler_out );
         graph.alloc();
+
+        lm_states->conv_graph = lm_states->transformer->graph;
     }
 
     GraphContext &graph = *lm_states->gctx;
+    // Restore the conversation view of the shared slot: the prompt path uses the
+    // same field for its own, differently-owned graph.
+    lm_states->transformer->graph = lm_states->conv_graph;
     moshi_lmmodel_forward_text_step( graph, scratch, lm, lm_states, input );
 
     scratch.compute();

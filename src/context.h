@@ -762,17 +762,28 @@ class StateContext {
     }
 
     void init() {
+        // A state registered through the no-data new_tensor() overload has no
+        // recorded initial value. Skipping it -- which is what this used to do --
+        // makes it INVISIBLE TO RESET: it silently keeps the previous
+        // conversation's contents, with no diagnostic. Zero it instead, so
+        // "everything in this context is back to its initial value" is true of
+        // every tensor rather than most of them.
         if (backend) {
             for ( auto state : states ) {
-                if ( ! state.data.size() )
+                if ( ! state.data.size() ) {
+                    ggml_backend_tensor_memset( *state.ptensor, 0, 0,
+                        ggml_nbytes( *state.ptensor ) );
                     continue;
+                }
                 ggml_backend_tensor_set( *state.ptensor, state.data.data(), 0,
                     state.data.size() );
             }
         } else {
             for ( auto state : states ) {
-                if ( ! state.data.size() )
+                if ( ! state.data.size() ) {
+                    memset( (*state.ptensor)->data, 0, ggml_nbytes( *state.ptensor ) );
                     continue;
+                }
                 memcpy( (*state.ptensor)->data, state.data.data(), state.data.size() );
             }
         }

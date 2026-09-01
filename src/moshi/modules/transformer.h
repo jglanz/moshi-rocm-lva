@@ -1111,7 +1111,42 @@ struct moshi_streaming_transformer_graph_t {
 struct moshi_streaming_transformer_state_t {
     int offset;
     own_ptr_vector<moshi_streaming_transformer_layer_state_t> layers;
+
+    // THE LIVE SLOT. Both graph disciplines write it, which is the whole problem
+    // `lazy_graph` below exists to solve -- see moshi_streaming_transformer_graph().
     moshi_streaming_transformer_graph_t graph;
+
+    // The lazy discipline's OWN copy of that slot.
+    //
+    // Two builders drive this one state and they are not compatible:
+    //
+    //   * moshi_streaming_transformer_graph() compiles a self-owned GraphContext
+    //     once and caches `.x` and `.result` in it. That is the PROMPT path
+    //     (moshi_lmmodel_forward_text / _forward_embedding).
+    //   * moshi_streaming_transformer_graph_build() is handed a CALLER's context
+    //     and overwrites `.ctx`, `.attn_bias`, `.offset` and `.indices` -- but
+    //     never `.x` or `.result`. That is the CONVERSATION path
+    //     (moshi_lmmodel_forward_text_build, against moshi_lmmodel_states_t::gctx).
+    //
+    // The lazy builder's only guard was `if (!graph.ctx)`, and nothing ever put
+    // that back to NULL -- not init(), not StateContext::init(), not the generator
+    // reset. So the first conversation step PERMANENTLY captured the slot, and
+    // every later prompt step then: wrote its embedding into the lazy graph's `.x`
+    // (which the conversation graph does not read), computed the CONVERSATION
+    // graph, and returned the lazy graph's frozen `.result`. Identical logits every
+    // step, so a constant argmax -- and on a generator being re-primed after a
+    // reset, ~40 such steps ran over freshly zeroed KV with a stale embedding and
+    // poisoned the prompt context.
+    //
+    // Symptom that led here: `m3-parity --twice` decoded 64 real ids on the first
+    // pass and a constant token on the second; a silence-only control produced no
+    // tokens at all on pass 1 (correct -- the model waits for a turn) and 32
+    // constant tokens on pass 2.
+    //
+    // The fix is aliasing only. Each discipline keeps its own copy of the slot and
+    // restores it before stepping; no ownership or lifetime changes, so it does not
+    // reopen the double-free this file's history is otherwise full of.
+    moshi_streaming_transformer_graph_t lazy_graph;
 };
 
 moshi_streaming_transformer_state_t * moshi_streaming_transformer_state(
@@ -1296,8 +1331,12 @@ ggml_tensor * moshi_streaming_transformer_graph(
 
     int64_t T = x->ne[1];
 
-    if ( ! states->graph.ctx ) {
-        // create graph
+    // Gated on OUR slot, not the shared one: the shared one may be holding the
+    // conversation path's borrowed context, and testing that is how this graph
+    // silently stopped being built.
+    if ( ! states->lazy_graph.ctx ) {
+        // create graph. It is built through the shared slot because
+        // _graph_build writes there, then snapshotted into ours.
         states->graph.ctx = new GraphContext( 256, ctx.backend );
 
         states->graph.x = ggml_dup_tensor( *states->graph.ctx, x );
@@ -1310,7 +1349,13 @@ ggml_tensor * moshi_streaming_transformer_graph(
         states->graph.ctx->build_forward_expand( result_cpy );
 
         states->graph.ctx->alloc();
+
+        states->lazy_graph = states->graph;
     }
+
+    // Restore OUR view of the slot on every call -- the conversation path may have
+    // overwritten it since, and _graph_step plus the copies below all read it.
+    states->graph = states->lazy_graph;
 
     moshi_streaming_transformer_graph_step( ctx, m, states, (int)T );
 
