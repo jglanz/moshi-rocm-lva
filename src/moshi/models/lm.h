@@ -979,6 +979,41 @@ bool moshi_lmgen_step(
 std::vector<int> SILENCE_TOKENS = { 948, 243, 1178, 546, 1736, 1030, 1978, 2008 };
 std::vector<int> SINE_TOKENS    = { 430, 1268, 381, 1611, 1095, 1495, 56, 472 };
 
+// Number of codebooks per stream in a personaplex frame: [audio_offset ..
+// audio_offset+8) is the MOSHI stream and the 8 above it are the USER stream.
+// Both SILENCE_TOKENS and SINE_TOKENS are exactly that wide.
+const int PERSONAPLEX_TOKENS_PER_STREAM = 8;
+
+// Fill the audio half of a system-prompt step's input: silence on the moshi
+// stream, and NOTHING on the user stream.
+//
+// SINE_TOKENS IS DELIBERATELY NOT APPLIED HERE, and the reason is a real structural
+// difference from the reference rather than an oversight.
+//
+// The reference passes moshi_tokens=SILENCE_TOKENS *and* input_tokens=SINE_TOKENS to
+// every system-prompt step (LMGen._step_audio_silence_core, _step_text_prompt_core).
+// But it does not feed them to the step directly: prepare_step_input() writes each
+// provided token into state.cache at (offset + delays[k]) and the step's model input
+// is cache[:, :, offset - 1], so a token "provided at step S" reaches the network
+// through the delay pipeline. THESE steppers bypass that pipeline entirely -- they
+// build `input` and hand it straight to moshi_lmmodel_forward_text() for step S, and
+// write the cache at `offset` with no delay applied.
+//
+// Adding the sine to a pipeline that is already a step out of phase makes the prefix
+// worse, not better, and measurably so. Measured on the M3 parity fixture (NATF0,
+// the M2 persona prompt, the M2 user turn): WITH the sine the model interrupts the
+// user 320 ms in with "Hey, let me know" and then falls silent for the rest of the
+// window; WITHOUT it, it waits for the user to finish and answers on returned frame
+// 126 against the reference's 127, with a near-identical token stream. So the user
+// half of the prompt is left alone until the steppers themselves are rewritten to go
+// through the cache the way the reference does.
+void moshi_lmgen_fill_prompt_audio( moshi_lmmodel_t * lm, std::vector<int> & input ) {
+    const int per_stream = PERSONAPLEX_TOKENS_PER_STREAM;
+    for ( int i = 0; i < per_stream && i < lm->num_audio_codebooks; i++ ) {
+        input[i + lm->audio_offset] = SILENCE_TOKENS[i];
+    }
+}
+
 void moshi_lmgen_step_voice_prompt(
     ScratchContext & scratch,
     moshi_lmgen_t * lmgen,
@@ -1097,12 +1132,12 @@ void moshi_lmgen_step_text_prompt_tokens(
     const int CT = (int) state->cache.size();
 
     for ( int t = 0; t < (int)tokens.size(); t++ ) {
-        // Build input: text token from prompt, silence audio tokens
+        // Build input: text token from prompt, silence on the moshi stream, and
+        // the user stream left alone -- see moshi_lmgen_fill_prompt_audio for why
+        // the reference's SINE_TOKENS are deliberately not applied here.
         std::vector<int> input( lm->num_codebooks );
         input[0] = tokens[t];
-        for ( int i = 0; i < (int)SILENCE_TOKENS.size() && i < lm->num_audio_codebooks; i++ ) {
-            input[i + lm->audio_offset] = SILENCE_TOKENS[i];
-        }
+        moshi_lmgen_fill_prompt_audio( lm, input );
 
         auto [scratch_transformer_out, text_logits] = moshi_lmmodel_forward_text(
             scratch, lm, lm_states, input, NULL );
@@ -1147,12 +1182,11 @@ void moshi_lmgen_step_audio_silence(
     const int CT = (int) state->cache.size();
 
     for ( int i = 0; i < n_steps; i++ ) {
-        // Build input: padding text token + silence audio tokens
+        // Build input: padding text token, silence on the moshi stream, and the
+        // user stream left alone -- see moshi_lmgen_fill_prompt_audio.
         std::vector<int> input( lm->num_codebooks );
         input[0] = 3; // text padding token
-        for ( int j = 0; j < (int)SILENCE_TOKENS.size() && j < lm->num_audio_codebooks; j++ ) {
-            input[j + lm->audio_offset] = SILENCE_TOKENS[j];
-        }
+        moshi_lmgen_fill_prompt_audio( lm, input );
 
         auto [scratch_transformer_out, text_logits] = moshi_lmmodel_forward_text(
             scratch, lm, lm_states, input, NULL );
@@ -1179,29 +1213,27 @@ void moshi_lmgen_step_audio_silence(
     }
 }
 
-// Backward-compatible stub (0-arg silence does nothing)
-void moshi_lmgen_step_audio_silence(
-    ScratchContext & ctx,
-    moshi_lmgen_t * lmgen,
-    moshi_lmgen_state_t * state,
-    moshi_lmmodel_states_t * lm_states
-) {
-    // Default: 8 steps of silence (~0.64s at 12.5fps)
-    moshi_lmgen_step_audio_silence( ctx, lmgen, state, lm_states, 8 );
-}
+// Reference default for the two silence slots that bracket the text prompt.
+//
+// This was 8 ("~0.64s at 12.5fps"). The reference implementation's LMGen defaults
+// audio_silence_frame_cnt to 1 and its server exposes it as a per-session knob, so
+// 1 is the value a prefix has to use to agree with the reference token for token.
+// moshi_lm_start() takes it as a parameter, so the old 8 is still reachable.
+const int PERSONAPLEX_AUDIO_SILENCE_FRAMES = 1;
 
 void moshi_lmgen_step_system_prompts(
     ScratchContext & ctx,
     moshi_lmgen_t * lmgen,
     moshi_lmgen_state_t * state,
     moshi_lmmodel_states_t * lm_states,
-    voice_t * voice
+    voice_t * voice,
+    int audio_silence_frames = PERSONAPLEX_AUDIO_SILENCE_FRAMES
 ) {
     moshi_lmgen_step_voice_prompt( ctx, lmgen, state, lm_states, voice );
-    moshi_lmgen_step_audio_silence( ctx, lmgen, state, lm_states );
+    moshi_lmgen_step_audio_silence( ctx, lmgen, state, lm_states, audio_silence_frames );
     if ( voice && voice->text_prompt_tokens.size() > 0 ) {
         moshi_lmgen_step_text_prompt_tokens( ctx, lmgen, state, lm_states,
             voice->text_prompt_tokens );
     }
-    moshi_lmgen_step_audio_silence( ctx, lmgen, state, lm_states );
+    moshi_lmgen_step_audio_silence( ctx, lmgen, state, lm_states, audio_silence_frames );
 }

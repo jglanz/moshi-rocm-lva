@@ -186,8 +186,20 @@ MOSHI_API int moshi_lm_load_voice_condition( moshi_context_t * moshi, moshi_lm_g
 MOSHI_API int moshi_lm_voice_prefix( moshi_lm_gen_t * gen, std::deque<int> & text_prefix, std::deque<std::vector<int>> & audio_prefix );
 MOSHI_API int moshi_lm_personaplex_load_voice( moshi_context_t * moshi, moshi_lm_gen_t * gen, const char * filename );
 MOSHI_API void moshi_lm_personaplex_set_text_prompt( moshi_lm_gen_t * gen, tokenizer_t * tok, const char * text );
+// Set the system text prefix from token ids the CALLER produced. The reference
+// PersonaPlex server wraps the persona script in <system> tags before encoding it;
+// that wrapping is application policy, not a model property, so it lives with the
+// caller and this entry point takes the finished ids.
+MOSHI_API void moshi_lm_personaplex_set_text_prompt_tokens( moshi_lm_gen_t * gen, const int * tokens, int n_tokens );
+// Read back whatever prefix is armed. Exists so a parity harness can prove its
+// prefix matches the oracle's before blaming the decode loop for a divergence.
+MOSHI_API int moshi_lm_personaplex_get_text_prompt_tokens( moshi_lm_gen_t * gen, std::vector<int> & tokens );
 
-MOSHI_API void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_temperature, float text_temperature, bool logging = false );
+// `audio_silence_frames` is the length of each of the two silence slots that
+// bracket the personaplex text prompt. 1 is the reference implementation's
+// default (LMGen.audio_silence_frame_cnt); the prefix only agrees with the
+// reference token for token at that value.
+MOSHI_API void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_temperature, float text_temperature, bool logging = false, int audio_silence_frames = 1 );
 MOSHI_API void moshi_lm_send( moshi_lm_gen_t * gen, Entry * entry );
 MOSHI_API int moshi_lm_receive( moshi_lm_gen_t * gen, int & text_token, std::vector<int16_t> & audio_tokens );
 MOSHI_API void moshi_lm_send2( moshi_lm_gen_t * gen, std::vector<int16_t> & audio_tokens );
