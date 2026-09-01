@@ -231,6 +231,16 @@ MOSHI_API void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, fl
 // is the point -- injection decisions do not come from the inference thread. The
 // caller owns all pacing policy (padding between sentences, per-injection caps,
 // cancellation); this is only the override mechanism.
+// The text logits the LAST step sampled from, valid until the next step.
+//
+// The argmax alone cannot tell a confident decision from a coin flip, and the
+// difference decides whether a token mismatch against a reference implementation is a
+// defect or numerical noise. Two stacks running the same bf16 weights will disagree on
+// a 0.3-logit near-tie and agree on everything decided by 2; without the distribution
+// there is no way to say which happened. Returns the number of logits, 0 if the graph
+// has not run yet.
+MOSHI_API int moshi_lm_get_text_logits( moshi_lm_gen_t * gen, std::vector<float> & logits );
+
 MOSHI_API void moshi_lm_personaplex_force_text_token( moshi_lm_gen_t * gen, int token );
 MOSHI_API void moshi_lm_personaplex_clear_forced_text_token( moshi_lm_gen_t * gen );
 // The armed-but-not-yet-consumed token, or -1.

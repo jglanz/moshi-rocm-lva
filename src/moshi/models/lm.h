@@ -425,6 +425,10 @@ struct moshi_lmmodel_states_t {
     int  transformer_T;
     ggml_tensor * transformer_out;
     ggml_tensor * sampler_out;
+    // The text logits the sampler consumed, kept reachable so a caller can read the
+    // DISTRIBUTION and not just the argmax. moshi_lm_get_text_logits() is the public
+    // door; see there for why a parity check needs it.
+    ggml_tensor * text_logits_out = NULL;
 
     GraphContext * depformer_gctx = NULL;
     lmmodel_depformer_embed_t depformer_embed;
@@ -1027,6 +1031,14 @@ bool moshi_lmgen_step(
 
         lm_states->sampler_out = moshi_sample_token( graph, text_logits,
             use_sampling, temp_text, top_k_text );
+
+        // Keep the logits as a graph output too. They are already computed -- the
+        // sampler reads them -- so this materialises an existing value rather than
+        // adding arithmetic, and the token streams are bit-identical with and
+        // without it (verified: the dumps used to derive the M3 parity margins
+        // produced the same 64 ids as the runs without them).
+        lm_states->text_logits_out = text_logits;
+        graph.build_forward_expand( text_logits );
 
         graph.build_forward_expand( lm_states->sampler_out );
         graph.alloc();

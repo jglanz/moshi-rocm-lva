@@ -1004,6 +1004,16 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
     }
 }
 
+int moshi_lm_get_text_logits( moshi_lm_gen_t * gen, std::vector<float> & logits ) {
+    logits.clear();
+    if ( ! gen->lm_states || ! gen->lm_states->text_logits_out )
+        return 0;
+    auto tensor = gen->lm_states->text_logits_out;
+    logits.resize( (size_t) ggml_nelements( tensor ) );
+    ggml_backend_tensor_get( tensor, logits.data(), 0, ggml_nbytes( tensor ) );
+    return (int) logits.size();
+}
+
 void moshi_lm_personaplex_force_text_token( moshi_lm_gen_t * gen, int token ) {
     gen->personaplex_forced_text_token.store( token, std::memory_order_release );
 }
