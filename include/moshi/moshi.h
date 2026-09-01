@@ -200,6 +200,23 @@ MOSHI_API int moshi_lm_personaplex_get_text_prompt_tokens( moshi_lm_gen_t * gen,
 // default (LMGen.audio_silence_frame_cnt); the prefix only agrees with the
 // reference token for token at that value.
 MOSHI_API void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_temperature, float text_temperature, bool logging = false, int audio_silence_frames = 1 );
+// Personaplex mid-conversation text-token injection. Arm the slot with the token
+// this frame must emit, then call moshi_lm_receive/moshi_lm_receive2: the step
+// overrides the sampled text token with it BEFORE the depformer runs, so the audio
+// heads condition on the forced token and the model speaks it in its own voice.
+// This is the same mechanism the reference server uses (LMGen.step(text_token=...)).
+//
+// One shot: every step consumes the slot with an atomic exchange, including steps
+// that return 0. `token` must be >= 0; a negative value is the same as clearing.
+// The slot is safe to arm from a thread other than the one running the step, which
+// is the point -- injection decisions do not come from the inference thread. The
+// caller owns all pacing policy (padding between sentences, per-injection caps,
+// cancellation); this is only the override mechanism.
+MOSHI_API void moshi_lm_personaplex_force_text_token( moshi_lm_gen_t * gen, int token );
+MOSHI_API void moshi_lm_personaplex_clear_forced_text_token( moshi_lm_gen_t * gen );
+// The armed-but-not-yet-consumed token, or -1.
+MOSHI_API int moshi_lm_personaplex_pending_forced_text_token( moshi_lm_gen_t * gen );
+
 MOSHI_API void moshi_lm_send( moshi_lm_gen_t * gen, Entry * entry );
 MOSHI_API int moshi_lm_receive( moshi_lm_gen_t * gen, int & text_token, std::vector<int16_t> & audio_tokens );
 MOSHI_API void moshi_lm_send2( moshi_lm_gen_t * gen, std::vector<int16_t> & audio_tokens );

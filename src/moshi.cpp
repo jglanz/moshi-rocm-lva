@@ -740,6 +740,12 @@ struct moshi_lm_gen_t {
 
     moshi_lmmodel_states_t * lm_states;
     moshi_lmgen_state_t * lmgen_state;
+
+    // One-shot injection slot handed to moshi_lmgen_t on the personaplex path.
+    // -1 == nothing armed. Atomic because it is armed from the caller's thread and
+    // consumed on the inference thread. NSDMI because moshi_lm_generator
+    // default-initializes.
+    std::atomic<int> personaplex_forced_text_token{-1};
 };
 
 moshi_lm_gen_t * moshi_lm_generator( moshi_lm_t * lm ) {
@@ -907,7 +913,8 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
             true, depth_temperature, text_temperature, 250, 25,
             gen->machine, gen->machine_state,
             gen->voice->sum,
-            &gen->voice->text_prefixes, &gen->voice->audio_prefixes
+            &gen->voice->text_prefixes, &gen->voice->audio_prefixes,
+            NULL // no injection on the state-machine (TTS) path
         };
         gen->lm_states = moshi_lmmodel_states( gen->state_ctx, gen->lm->model, gen->voice->cross );
     } else {
@@ -917,7 +924,9 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
             NULL, NULL, // no state machine
             NULL, // no cross
             NULL, NULL, // empty prefixes
+            &gen->personaplex_forced_text_token,
         };
+        gen->personaplex_forced_text_token.store( -1, std::memory_order_release );
         gen->lm_states = moshi_lmmodel_states( gen->state_ctx, gen->lm->model, NULL );
     }
     gen->lmgen_state = moshi_lmgen_state( gen->lm->model );
@@ -938,6 +947,18 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
             audio_silence_frames
         );
     }
+}
+
+void moshi_lm_personaplex_force_text_token( moshi_lm_gen_t * gen, int token ) {
+    gen->personaplex_forced_text_token.store( token, std::memory_order_release );
+}
+
+void moshi_lm_personaplex_clear_forced_text_token( moshi_lm_gen_t * gen ) {
+    gen->personaplex_forced_text_token.store( -1, std::memory_order_release );
+}
+
+int moshi_lm_personaplex_pending_forced_text_token( moshi_lm_gen_t * gen ) {
+    return gen->personaplex_forced_text_token.load( std::memory_order_acquire );
 }
 
 void moshi_lm_send( moshi_lm_gen_t * gen, Entry * entry ) {

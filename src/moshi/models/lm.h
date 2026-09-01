@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <deque>
 
 class TokenIds {
@@ -773,6 +774,16 @@ struct moshi_lmgen_t {
     // these are from the TTSModel callbacks on_text, on_audio
     std::deque<int> * text_prefixes;
     std::deque<std::vector<int>> * audio_prefixes;
+
+    // personaplex mid-conversation text-token injection (see moshi_lmgen_step).
+    // Points at a one-shot slot the caller arms before each step; NULL disables
+    // the mechanism entirely, which is what every non-personaplex caller gets.
+    //
+    // ATOMIC because the two ends are different threads: the caller arms the slot
+    // from whatever thread decided to inject, and the step consumes it on the
+    // inference thread. A plain int there is a data race, and the arm-then-consume
+    // handshake is exactly the shape that loses a token when it tears.
+    std::atomic<int> * forced_text_token;
 };
 
 bool moshi_lmgen_step(
@@ -797,6 +808,7 @@ bool moshi_lmgen_step(
     auto condition_sum = lmgen->condition_sum;
     auto text_prefixes = lmgen->text_prefixes;
     auto audio_prefixes = lmgen->audio_prefixes;
+    auto forced_text_token = lmgen->forced_text_token;
     //ProfileScope profile(time_lmgen_step_us);
     const int CT = (int) state->cache.size();
     int dep_q = lm->dep_q;
@@ -875,6 +887,33 @@ bool moshi_lmgen_step(
     int text_token;
     ggml_backend_tensor_get( lm_states->sampler_out, &text_token, 0, 4 );
 #endif
+
+    // personaplex text-token injection.
+    //
+    // `text_token` has just been read back from the live sampler above, and
+    // moshi_lmmodel_depformer_step() below consumes it to produce this frame's
+    // audio codes. Overriding it HERE -- after the sample, strictly before the
+    // depformer -- is what makes the model SPEAK the injected token rather than
+    // merely report it: the audio heads condition on the text token.
+    //
+    // The on_text_hook immediately below cannot be reused for this. It is guarded
+    // by `machine`, and moshi_lm_start() constructs a personaplex generator with
+    // machine == NULL and NULL prefix deques, so that whole block is dead on the
+    // personaplex path.
+    //
+    // The slot is ONE SHOT: the caller arms it before each step and the step
+    // consumes it, so a stale forcing cannot leak into a later frame. Note that
+    // every call consumes it, including the ones that return false -- forcing
+    // happens at sampling time, while the caller observes tokens delay-compensated
+    // out of state->cache further down, max_delay - delays[0] frames later.
+    if ( forced_text_token ) {
+        // exchange, not load-then-store: consuming the slot has to be one
+        // indivisible step or a token armed between the two halves is dropped.
+        const int forced = forced_text_token->exchange( -1, std::memory_order_acq_rel );
+        if ( forced >= 0 ) {
+            text_token = forced;
+        }
+    }
 
     // on_text_hook
     if ( machine ) {
