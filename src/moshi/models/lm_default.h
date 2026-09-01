@@ -219,6 +219,14 @@ moshi_lmmodel_t * moshi_lmmodel_alloc_default( moshi_config_t * config ) {
     lmmodel->audio_offset = 1;
     lmmodel->text_initial_token_id = (int) config->text_card;
     lmmodel->initial_token_id = (int) config->card;
+    // `existing_text_padding_id` was parsed and then read by nothing: the value was
+    // spelled 3 at every use site. It is read here now. A config that omits the key
+    // leaves the field 0 (== new_word), which would silently corrupt every padded
+    // frame, so an out-of-range value falls back to the id those sites used to
+    // hardcode rather than to whatever the JSON left behind.
+    lmmodel->text_padding_token_id = config->existing_text_padding_id > 0
+        ? (int) config->existing_text_padding_id
+        : MOSHI_DEFAULT_TEXT_PADDING_ID;
     
     lmmodel->personaplex = config->model_type == "personaplex";
 

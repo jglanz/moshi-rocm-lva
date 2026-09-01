@@ -597,6 +597,43 @@ std::string tokenizer_id_to_piece( tokenizer_t * tok, int token ) {
     return tok->sp.IdToPiece( token );
 }
 
+int tokenizer_encode( tokenizer_t * tok, const char * text, std::vector<int> & tokens ) {
+    tokens.clear();
+    if ( ! text || ! text[0] )
+        return 0;
+    tok->sp.Encode( std::string( text ), &tokens );
+    return (int) tokens.size();
+}
+
+std::string tokenizer_id_to_text( tokenizer_t * tok, int token ) {
+    // The SentencePiece piece with its word-initial marker U+2581 turned back into
+    // a space.
+    //
+    // This matches the WHOLE three-byte sequence E2 96 81, where the copies open-
+    // coded in tools/ (tools/moshi-stt.cpp:588 and three siblings,
+    // tools/moshi-sts.cpp:917) test only the lead byte 0xE2 and then skip three
+    // bytes unconditionally. 0xE2 leads every character in U+2000-U+2FFF, so those
+    // copies silently replace an em dash, a curly quote, an ellipsis or a euro sign
+    // with a space. Harmless for the ASCII-heavy en/fr vocabularies they were
+    // written against; not something to propagate into a library function that a
+    // transcript consumer will trust.
+    const std::string piece = tok->sp.IdToPiece( token );
+    std::string text;
+    text.reserve( piece.size() );
+    for ( size_t ci = 0; ci < piece.size(); ci++ ) {
+        const unsigned char b0 = (unsigned char) piece[ci];
+        if ( b0 == 0xE2 && ci + 2 < piece.size()
+             && (unsigned char) piece[ci + 1] == 0x96
+             && (unsigned char) piece[ci + 2] == 0x81 ) {
+            text += ' ';
+            ci += 2;
+            continue;
+        }
+        text += piece[ci];
+    }
+    return text;
+}
+
 // MARK: LM
 
 struct moshi_lm_t {
@@ -649,6 +686,23 @@ int moshi_lm_get_max_delay( moshi_lm_t * lm ) {
 
 int moshi_lm_get_delay_steps( moshi_lm_t * lm ) {
     return lm->model->delay_steps;
+}
+
+int moshi_lm_get_text_card( moshi_lm_t * lm ) {
+    return lm->model->text_card;
+}
+
+int moshi_lm_get_text_padding_token_id( moshi_lm_t * lm ) {
+    return lm->model->text_padding_token_id;
+}
+
+int moshi_lm_get_text_new_word_token_id( moshi_lm_t * lm ) {
+    (void) lm;
+    return TokenIds().new_word;
+}
+
+int moshi_lm_get_text_delay( moshi_lm_t * lm ) {
+    return lm->model->delays.empty() ? 0 : lm->model->delays[0];
 }
 
 bool moshi_lm_quantize( moshi_lm_t * lm, const char * quant ) {
@@ -905,7 +959,8 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
     ggml_tensor * condition_cross = NULL;
     if ( gen->voice && ! gen->lm->model->personaplex ) {
         condition_cross = gen->voice->cross;
-        gen->machine = new StateMachine(gen->lm->model->text_card + 1, second_stream_ahead, max_padding, initial_padding);
+        gen->machine = new StateMachine(gen->lm->model->text_card + 1, second_stream_ahead, max_padding, initial_padding,
+            gen->lm->model->text_padding_token_id);
         gen->machine->logging = logging;
         gen->machine_state = gen->machine->new_state();
         gen->lmgen = moshi_lmgen_t{

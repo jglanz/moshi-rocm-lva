@@ -75,6 +75,14 @@ MOSHI_API bool tokenizer_empty( tokenizer_t * tok );
 MOSHI_API int tokenizer_send( tokenizer_t * tok, std::string text );
 MOSHI_API int tokenizer_receive( tokenizer_t * tok, Entry * entry );
 MOSHI_API std::string tokenizer_id_to_piece( tokenizer_t * tok, int token );
+// Encode a whole string in one SentencePiece call and return the token count.
+// tokenizer_send/tokenizer_receive is the streaming word-at-a-time path used to
+// drive the TTS state machine; it is not a way to tokenize a string, and there was
+// no other way to do it through the public API.
+MOSHI_API int tokenizer_encode( tokenizer_t * tok, const char * text, std::vector<int> & tokens );
+// tokenizer_id_to_piece() with the SentencePiece word-initial marker U+2581
+// turned back into a space -- the monologue tap every tool in tools/ open-codes.
+MOSHI_API std::string tokenizer_id_to_text( tokenizer_t * tok, int token );
 
 // MARK: Config
 
@@ -170,6 +178,17 @@ MOSHI_API void unref( moshi_lm_t * lm );
 MOSHI_API void moshi_lm_set_delay_steps( moshi_lm_t * lm, int delay_steps );
 MOSHI_API int moshi_lm_get_max_delay( moshi_lm_t * lm );
 MOSHI_API int moshi_lm_get_delay_steps( moshi_lm_t * lm );
+// Special text-token ids, so a consumer of the monologue tap never has to spell
+// them. `text_padding_token_id` comes from the model config's
+// `existing_text_padding_id`; the pair {new_word, pad} is what upstream's tools
+// filter out of the monologue before printing it.
+MOSHI_API int moshi_lm_get_text_card( moshi_lm_t * lm );
+MOSHI_API int moshi_lm_get_text_padding_token_id( moshi_lm_t * lm );
+MOSHI_API int moshi_lm_get_text_new_word_token_id( moshi_lm_t * lm );
+// delays[0]. A token forced at sampling time reaches the moshi_lm_receive
+// out-parameter max_delay - text_delay frames later; a tap that needs to align
+// forced tokens with observed ones needs both numbers.
+MOSHI_API int moshi_lm_get_text_delay( moshi_lm_t * lm );
 MOSHI_API bool moshi_lm_quantize( moshi_lm_t * lm, const char * quant );
 MOSHI_API int moshi_lm_load( moshi_lm_t * lm );
 MOSHI_API void moshi_lm_save_gguf( moshi_lm_t * lm, const char * filepath );

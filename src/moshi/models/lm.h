@@ -3,17 +3,23 @@
 #include <atomic>
 #include <deque>
 
+// The padding id every caller fell back on before it was read from the model
+// config. Kept as the fallback for configs that omit `existing_text_padding_id`,
+// and as the default here so no caller has to spell it.
+const int MOSHI_DEFAULT_TEXT_PADDING_ID = 3;
+
 class TokenIds {
 public:
     int card;
     const int new_word = 0;
-    const int pad = 3;
+    const int pad;
     const int main = 1;
     const int other = 2;
     const int zero = -1;
     const int ungenerated = -2;
 
-    TokenIds(int card = 8001) {
+    TokenIds(int card = 8001, int pad = MOSHI_DEFAULT_TEXT_PADDING_ID)
+        : pad(pad) {
         this->card = card;
     }
 };
@@ -65,8 +71,9 @@ public:
             int text_card,
             int second_stream_ahead = 0,
             int max_padding = 6,
-            int initial_padding = 2) {
-        token_ids.card = text_card;
+            int initial_padding = 2,
+            int text_padding_token_id = MOSHI_DEFAULT_TEXT_PADDING_ID)
+            : token_ids( text_card, text_padding_token_id ) {
         this->second_stream_ahead = second_stream_ahead;
         this->max_padding = max_padding;
         this->initial_padding = initial_padding;
@@ -365,6 +372,9 @@ struct moshi_lmmodel_t {
     int delay_steps;
     int text_initial_token_id;
     int initial_token_id;
+    // From the model config's `existing_text_padding_id`. Every site that used to
+    // spell 3 reads this instead.
+    int text_padding_token_id;
     bool personaplex;
 };
 
@@ -1092,7 +1102,7 @@ void moshi_lmgen_step_voice_prompt(
             auto text_token = moshi_sample_token_int( scratch, text_logits,
                 use_sampling, temp_text, top_k_text );
 
-            text_token = 3;
+            text_token = lmgen->lm->text_padding_token_id;
 
             moshi_lmmodel_depformer_step(
                 scratch, lmgen->lm, lm_states,
@@ -1188,7 +1198,7 @@ void moshi_lmgen_step_text_prompt_tokens(
         // Sample but override to padding token (model is being conditioned, not generating)
         auto text_token = moshi_sample_token_int( scratch, text_logits,
             use_sampling, temp_text, top_k_text );
-        text_token = 3; // force padding
+        text_token = lm->text_padding_token_id; // force padding
 
         moshi_lmmodel_depformer_step(
             scratch, lm, lm_states,
@@ -1224,7 +1234,7 @@ void moshi_lmgen_step_audio_silence(
         // Build input: padding text token, silence on the moshi stream, and the
         // user stream left alone -- see moshi_lmgen_fill_prompt_audio.
         std::vector<int> input( lm->num_codebooks );
-        input[0] = 3; // text padding token
+        input[0] = lm->text_padding_token_id; // text padding token
         moshi_lmgen_fill_prompt_audio( lm, input );
 
         auto [scratch_transformer_out, text_logits] = moshi_lmmodel_forward_text(
@@ -1236,7 +1246,7 @@ void moshi_lmgen_step_audio_silence(
 
         auto text_token = moshi_sample_token_int( scratch, text_logits,
             use_sampling, temp_text, top_k_text );
-        text_token = 3; // force padding
+        text_token = lm->text_padding_token_id; // force padding
 
         moshi_lmmodel_depformer_step(
             scratch, lm, lm_states,
