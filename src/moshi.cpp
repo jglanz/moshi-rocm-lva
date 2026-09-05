@@ -993,7 +993,7 @@ int moshi_lm_personaplex_get_text_prompt_tokens( moshi_lm_gen_t * gen, std::vect
 
 void moshi_lm_prime( moshi_context_t * moshi, moshi_lm_gen_t * gen, int audio_silence_frames );
 
-void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_temperature, float text_temperature, bool logging, int audio_silence_frames ) {
+void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_temperature, float text_temperature, bool logging, int audio_silence_frames, bool prime ) {
     const int max_padding = 8;
     const int initial_padding = 2;
     const int second_stream_ahead = gen->lm->second_stream_ahead;
@@ -1032,7 +1032,15 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
     gen->ctx = new ScratchContext( 256, moshi->backend );
     gen->audio_tokens.resize( gen->lm->model->num_audio_codebooks );
 
-    moshi_lm_prime( moshi, gen, audio_silence_frames );
+    // prime=false stops HERE, with the arena allocated and its device tensors
+    // still uninitialized. That is deliberate and it is not a half-measure: the
+    // only sanctioned next step is a snapshot restore, which writes every one of
+    // those tensors plus every scalar the seed would have set. Seeding first would
+    // be a 1.5 GiB host-to-device pass whose every byte the restore then
+    // overwrites -- measured at 1.8 s on this card, which is most of what the
+    // snapshot exists to save.
+    if ( prime )
+        moshi_lm_prime( moshi, gen, audio_silence_frames );
 }
 
 // The PRIME half of moshi_lm_start: put the generator back to the state a fresh
@@ -1082,6 +1090,121 @@ void moshi_lm_reset( moshi_context_t * moshi, moshi_lm_gen_t * gen, int audio_si
     if ( ! gen || ! gen->state_ctx || ! gen->lm_states || ! gen->lmgen_state || ! gen->ctx )
         return;
     moshi_lm_prime( moshi, gen, audio_silence_frames );
+}
+
+// MARK: Primed-state snapshot
+//
+// WHAT IS IN HERE IS THE WHOLE CONTRACT, so it is worth naming each piece and why
+// the ones that are absent are absent.
+//
+//   * `tensors` -- every tensor the state context owns, in registration order:
+//     the transformer and depformer KV caches, any cached cross-attention k/v, and
+//     lm_states->transformer_out. This is the bulk, and it is bounded by the STATE
+//     context, not by the weights.
+//   * `transformer_offset` -- the main transformer's live offset. It indexes the KV
+//     ring on every step (moshi_streaming_transformer_graph_step reads it and
+//     advances it), so a snapshot that restored the cache but not this one would
+//     read the right memory at the wrong positions: consistent, plausible, wrong.
+//   * `lmgen` -- the generator's delay cache, its `provided` masks, the offset and
+//     the initial tokens. The prompt phase leaves the cache holding the restored
+//     voice cache and the masks holding the last replayed step's flags, and the
+//     first conversation step reads both.
+//
+// DELIBERATELY ABSENT:
+//   * The depformer's offset. It is consumed ONLY while the depformer graph is
+//     being built -- moshi_lmmodel_depformer_step builds once and thereafter only
+//     computes -- so after the build it is inert, and before the build the only
+//     correct value is the 0 that init() leaves. Restoring the captured value into
+//     a generator that has not built its depformer graph yet would bake the wrong
+//     cache indices into it, which is why restore writes 0 rather than the capture.
+//   * The compiled graphs (lm_states->gctx, depformer_gctx, and the transformer's
+//     graph / lazy_graph / conv_graph slots). Those are compute plans, not
+//     conversation state; they are built on demand and each discipline restores its
+//     own view before stepping (see the comments in transformer.h).
+//   * The voice and the text prompt. They are INPUTS to the state this snapshot
+//     holds, not part of it -- see the header's note that keying is the caller's.
+//   * StateMachine state, which is why both entry points refuse a generator that
+//     has one.
+struct moshi_lm_snapshot_t {
+    // Identity: which model's state layout this blob describes.
+    const moshi_lm_t * lm = NULL;
+    size_t n_tensors = 0;
+
+    std::vector<uint8_t> tensors;
+    int transformer_offset = 0;
+    moshi_lmgen_state_t lmgen;
+
+    bool valid = false;
+};
+
+moshi_lm_snapshot_t * moshi_lm_snapshot_alloc() {
+    return new moshi_lm_snapshot_t;
+}
+
+void unref( moshi_lm_snapshot_t * snapshot ) {
+    delete snapshot;
+}
+
+size_t moshi_lm_snapshot_bytes( moshi_lm_snapshot_t * snapshot ) {
+    if ( ! snapshot || ! snapshot->valid )
+        return 0;
+    size_t bytes = snapshot->tensors.size();
+    // The host-side halves, counted honestly: a caller sizing a cache wants the
+    // real per-entry cost, and the delay cache is not free.
+    for ( const auto & slot : snapshot->lmgen.cache )
+        bytes += slot.size() * sizeof( int );
+    for ( const auto & slot : snapshot->lmgen.provided )
+        bytes += slot.size();
+    bytes += snapshot->lmgen.initial.size() * sizeof( int );
+    return bytes;
+}
+
+size_t moshi_lm_snapshot_state_bytes( moshi_lm_gen_t * gen ) {
+    if ( ! gen || ! gen->state_ctx )
+        return 0;
+    return gen->state_ctx->state_nbytes();
+}
+
+int moshi_lm_snapshot_capture( moshi_lm_gen_t * gen, moshi_lm_snapshot_t * snapshot ) {
+    if ( ! gen || ! snapshot )
+        return -1;
+    if ( ! gen->state_ctx || ! gen->lm_states || ! gen->lmgen_state )
+        return -1;
+    if ( gen->machine )
+        return -2;
+
+    snapshot->valid = false;
+    if ( ! gen->state_ctx->save( snapshot->tensors ) )
+        return -1;
+    snapshot->lm                 = gen->lm;
+    snapshot->n_tensors          = gen->state_ctx->states.size();
+    snapshot->transformer_offset = gen->lm_states->transformer->offset;
+    snapshot->lmgen              = *gen->lmgen_state;
+    snapshot->valid              = true;
+    return 0;
+}
+
+int moshi_lm_snapshot_restore( moshi_lm_gen_t * gen, moshi_lm_snapshot_t * snapshot ) {
+    if ( ! gen || ! snapshot || ! snapshot->valid )
+        return -1;
+    if ( ! gen->state_ctx || ! gen->lm_states || ! gen->lmgen_state )
+        return -1;
+    if ( gen->machine )
+        return -2;
+    // Same model and same registration list, or the blob describes something else.
+    if ( snapshot->lm != gen->lm )
+        return -3;
+    if ( snapshot->n_tensors != gen->state_ctx->states.size() )
+        return -3;
+    if ( ! gen->state_ctx->load( snapshot->tensors ) )
+        return -3;
+
+    gen->lm_states->transformer->offset = snapshot->transformer_offset;
+    if ( gen->lm_states->depformer )
+        gen->lm_states->depformer->offset = 0;   // see the comment on the struct
+    *gen->lmgen_state = snapshot->lmgen;
+    gen->personaplex_forced_text_token.store( -1, std::memory_order_release );
+    return 0;
 }
 
 int moshi_lm_get_text_logits( moshi_lm_gen_t * gen, std::vector<float> & logits ) {

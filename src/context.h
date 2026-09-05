@@ -761,6 +761,66 @@ class StateContext {
             buffer = ggml_backend_alloc_ctx_tensors( ctx, backend );
     }
 
+    // Bytes every registered tensor occupies, together. This is the size of ONE
+    // conversation's state -- the KV caches and the streaming buffers -- and has
+    // nothing to do with the weights, which live in their own contexts. A caller
+    // that wants to hold a snapshot of a primed conversation needs this number
+    // before it decides how many to hold.
+    size_t state_nbytes() const {
+        size_t total = 0;
+        for ( const auto & state : states )
+            total += ggml_nbytes( *state.ptensor );
+        return total;
+    }
+
+    // Copy the LIVE contents of every registered tensor out to host memory, in
+    // registration order, and back in again.
+    //
+    // WHY THESE EXIST. init() puts this context back to the value it started at;
+    // these put it back to the value it had at an ARBITRARY moment -- specifically
+    // the moment a generator finished its system-prompt phase, which costs one full
+    // forward pass per prompt token and is identical every time the same prompt is
+    // primed. Saving it once and reloading it is the difference between paying that
+    // loop per conversation and paying it per distinct prompt.
+    //
+    // The blob is only meaningful to a context with the SAME registration list --
+    // same model, same shapes, same order. load() checks the total size, which is
+    // the cheap half of that; the caller owns the other half (it must not hand a
+    // blob from one model's generator to another's), and moshi_lm_snapshot_restore
+    // is where that check lives.
+    bool save( std::vector<uint8_t> & out ) const {
+        if ( ! ctx )
+            return false;
+        out.resize( state_nbytes() );
+        size_t at = 0;
+        for ( const auto & state : states ) {
+            const size_t n = ggml_nbytes( *state.ptensor );
+            if ( backend )
+                ggml_backend_tensor_get( *state.ptensor, out.data() + at, 0, n );
+            else
+                memcpy( out.data() + at, (*state.ptensor)->data, n );
+            at += n;
+        }
+        return true;
+    }
+
+    bool load( const std::vector<uint8_t> & in ) {
+        if ( ! ctx )
+            return false;
+        if ( in.size() != state_nbytes() )
+            return false;
+        size_t at = 0;
+        for ( auto & state : states ) {
+            const size_t n = ggml_nbytes( *state.ptensor );
+            if ( backend )
+                ggml_backend_tensor_set( *state.ptensor, in.data() + at, 0, n );
+            else
+                memcpy( (*state.ptensor)->data, in.data() + at, n );
+            at += n;
+        }
+        return true;
+    }
+
     void init() {
         // A state registered through the no-data new_tensor() overload has no
         // recorded initial value. Skipping it -- which is what this used to do --

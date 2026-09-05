@@ -218,7 +218,18 @@ MOSHI_API int moshi_lm_personaplex_get_text_prompt_tokens( moshi_lm_gen_t * gen,
 // bracket the personaplex text prompt. 1 is the reference implementation's
 // default (LMGen.audio_silence_frame_cnt); the prefix only agrees with the
 // reference token for token at that value.
-MOSHI_API void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_temperature, float text_temperature, bool logging = false, int audio_silence_frames = 1 );
+//
+// `prime` false ALLOCATES ONLY: the arena, the state context and the generator
+// state exist, and nothing has been seeded or primed -- the state tensors still
+// hold whatever the allocator handed back. The generator that comes back is NOT
+// usable, and the only sanctioned next step is moshi_lm_snapshot_restore() with a
+// snapshot taken from a generator on this same model primed with the prompt this
+// one wants; that call writes every tensor and every scalar a seed would have.
+// (If the restore is refused, moshi_lm_reset() makes the generator usable again.)
+// Seeding first would be a full host-to-device pass whose every byte the restore
+// overwrites -- 1.5 GiB and 1.8 s on PersonaPlex-7B, which is most of what the
+// snapshot exists to save. See the snapshot section below.
+MOSHI_API void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_temperature, float text_temperature, bool logging = false, int audio_silence_frames = 1, bool prime = true );
 
 // Put a started generator back to a virgin conversation WITHOUT reallocating any of
 // its state: the delay cache, the state tensors, the streaming states and the
@@ -232,7 +243,54 @@ MOSHI_API void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, fl
 // through the same prompt phase, so a different silence bracket here would mean a
 // reset generator was conditioned differently from a fresh one -- silently, and
 // only on the second conversation.
+// A caller that means to RESTORE a snapshot instead of re-priming does not call
+// this at all: moshi_lm_snapshot_restore() writes a superset of what a reset does,
+// so a reset before it is pure cost. Call this to prime, or to recover a generator
+// whose restore was refused.
 MOSHI_API void moshi_lm_reset( moshi_context_t * moshi, moshi_lm_gen_t * gen, int audio_silence_frames = 1 );
+
+// MARK: Primed-state snapshot
+//
+// THE PROBLEM. The system-prompt phase moshi_lm_prime runs is ONE FULL FORWARD PASS
+// PER PROMPT TOKEN, plus the voice-prompt replay and two silence brackets
+// (moshi_lmgen_step_system_prompts). Its cost is linear in the persona's length:
+// measured on a gfx1100, 25 prompt tokens reach ready in 6.0 s and 282 in 16.3 s,
+// and a host that sends its agent instructions as the persona sends a thousand.
+// Every reconnect re-pays it, and it recomputes the same thing every time: for a
+// FIXED (voice, prompt, silence-bracket) the primed state is a pure function of
+// those inputs, sampled greedily at the temperature the config carries.
+//
+// SO SAVE IT. A snapshot is everything a conversation owns and nothing it shares:
+// the state context's tensors (KV caches and streaming buffers, bounded by the
+// state context -- NOT by the weights), the transformer's live offset, and the
+// generator's delay cache with its `provided` masks. Restoring it puts a generator
+// into the state the prompt phase would have left it in, with no forward passes at
+// all. moshi_lm_snapshot_bytes() reports what one costs; the blob is host memory,
+// so holding a few does not compete with the model for device memory.
+//
+// SCOPE. The state-machine (TTS) path is NOT covered -- StateMachine's own state is
+// not in the snapshot -- so capture and restore both refuse a generator that has
+// one, with -2. A snapshot is only valid for the generator's own moshi_lm_t and for
+// a state context with the identical registration list; restore checks both and
+// refuses with -3 rather than writing a mismatched blob.
+//
+// CORRECTNESS IS THE CALLER'S HALF. Nothing here knows what prompt produced the
+// state it holds. A caller that restores a snapshot taken under a DIFFERENT voice
+// or prompt gets a perfectly consistent generator conditioned on the wrong persona,
+// with no diagnostic. Key the cache on every input that feeds the prompt phase.
+struct moshi_lm_snapshot_t;
+
+MOSHI_API moshi_lm_snapshot_t * moshi_lm_snapshot_alloc();
+MOSHI_API void unref( moshi_lm_snapshot_t * snapshot );
+// Host bytes this snapshot holds; 0 before a successful capture.
+MOSHI_API size_t moshi_lm_snapshot_bytes( moshi_lm_snapshot_t * snapshot );
+// What ONE snapshot of this generator would cost, without taking it.
+MOSHI_API size_t moshi_lm_snapshot_state_bytes( moshi_lm_gen_t * gen );
+// 0 on success; -1 unusable generator/snapshot, -2 state-machine generator.
+MOSHI_API int moshi_lm_snapshot_capture( moshi_lm_gen_t * gen, moshi_lm_snapshot_t * snapshot );
+// 0 on success; -1 unusable, -2 state-machine generator, -3 the snapshot does not
+// belong to this generator's model/state layout.
+MOSHI_API int moshi_lm_snapshot_restore( moshi_lm_gen_t * gen, moshi_lm_snapshot_t * snapshot );
 // Personaplex mid-conversation text-token injection. Arm the slot with the token
 // this frame must emit, then call moshi_lm_receive/moshi_lm_receive2: the step
 // overrides the sampled text token with it BEFORE the depformer runs, so the audio
