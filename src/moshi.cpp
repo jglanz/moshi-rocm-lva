@@ -1229,6 +1229,40 @@ int moshi_lm_personaplex_pending_forced_text_token( moshi_lm_gen_t * gen ) {
     return gen->personaplex_forced_text_token.load( std::memory_order_acquire );
 }
 
+int moshi_lm_personaplex_ingest_text_tokens( moshi_lm_gen_t * gen, const int * tokens, int n_tokens, int audio_silence_frames ) {
+    // Everything moshi_lm_start builds, because the stepper reads all of it.
+    if ( ! gen || ! gen->ctx || ! gen->lmgen_state || ! gen->lm_states || ! gen->state_ctx )
+        return -1;
+    // The stepper does not maintain StateMachine state, and the personaplex prompt
+    // audio it supplies is not the TTS path's discipline. Same refusal shape as the
+    // snapshot entry points, for the same reason.
+    if ( gen->machine )
+        return -2;
+    if ( ! gen->lm || ! gen->lm->model || ! gen->lm->model->personaplex )
+        return -2;
+    if ( ! tokens || n_tokens <= 0 )
+        return 0;
+
+    // A token armed but not yet consumed belongs to the CONVERSATION step that armed
+    // it, and these steps are not that step: leaving it armed would let the first
+    // ingest step swallow it. Clearing is the honest resolution -- the caller that
+    // armed it is the caller asking for the ingest.
+    gen->personaplex_forced_text_token.store( -1, std::memory_order_release );
+
+    std::vector<int> ids( tokens, tokens + n_tokens );
+    // The same three-phase shape moshi_lmgen_step_system_prompts uses, minus the
+    // voice-prompt replay (this generator is already conditioned on its voice).
+    if ( audio_silence_frames > 0 )
+        moshi_lmgen_step_audio_silence(
+            *gen->ctx, &gen->lmgen, gen->lmgen_state, gen->lm_states, audio_silence_frames );
+    moshi_lmgen_step_text_prompt_tokens(
+        *gen->ctx, &gen->lmgen, gen->lmgen_state, gen->lm_states, ids );
+    if ( audio_silence_frames > 0 )
+        moshi_lmgen_step_audio_silence(
+            *gen->ctx, &gen->lmgen, gen->lmgen_state, gen->lm_states, audio_silence_frames );
+    return n_tokens;
+}
+
 void moshi_lm_send( moshi_lm_gen_t * gen, Entry * entry ) {
     gen->machine_state->entries.push_back( *entry );
 }

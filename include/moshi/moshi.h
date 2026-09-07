@@ -318,6 +318,47 @@ MOSHI_API void moshi_lm_personaplex_clear_forced_text_token( moshi_lm_gen_t * ge
 // The armed-but-not-yet-consumed token, or -1.
 MOSHI_API int moshi_lm_personaplex_pending_forced_text_token( moshi_lm_gen_t * gen );
 
+// MARK: Mid-conversation context ingest
+//
+// WHAT IT IS. The system-prompt phase's text stepper
+// (moshi_lmgen_step_text_prompt_tokens), reachable on a generator that is ALREADY
+// in a conversation -- so a caller can put text into the model's context WITHOUT
+// re-priming it and WITHOUT the model speaking that text.
+//
+// WHY IT IS NOT THE INJECTION SLOT. moshi_lm_personaplex_force_text_token supplies
+// a text token and lets the depformer generate the audio for it: the model SAYS the
+// token, in its own voice, on the frame the caller chose. That is teacher-forcing,
+// and the caller owns the timing of every word. This entry point supplies the text
+// token AND SILENCE on the assistant's own audio stream -- exactly what the prompt
+// phase does (moshi_lmgen_provide_prompt_audio) -- so the tokens land in context as
+// something the model has READ, not as something it has said. The model then
+// generates its own tokens, at its own pace, afterwards.
+//
+// COST, AND WHY IT IS NOT FREE. One full forward pass per token, off the
+// conversation's frame clock: the same per-token cost the prompt phase pays. A
+// caller that runs this inside a real-time loop is stalling that loop for
+// n_tokens * step_time. There is NO cheaper door: the model has one text stream,
+// and putting a token into its context means running the network on it.
+//
+// STATE ADVANCED, NOT RESET. The generator's offset advances by n_tokens, so the
+// model experiences the ingest as elapsed conversation time in which it read text
+// and stayed silent. Nothing is reallocated and no prompt is re-primed; the persona,
+// the voice and everything said so far are untouched.
+//
+// SCOPE. personaplex generators only, and never one carrying a StateMachine (the
+// TTS path), whose own state this stepper does not maintain.
+//
+// BRACKETED IN SILENCE, exactly as moshi_lmgen_step_system_prompts brackets the
+// persona. `audio_silence_frames` steps of text padding + silent audio run before
+// and after the tokens. That bracket is not decoration: it is how the model is told
+// the span is a break in its speech rather than a continuation of the sentence it
+// was in the middle of. 0 disables it and hands the tokens to a model still mid-word.
+//
+// Returns the number of tokens ingested (the text tokens, NOT the silence steps); 0
+// for an empty request; -1 for an unusable generator; -2 for a state-machine or
+// non-personaplex generator.
+MOSHI_API int moshi_lm_personaplex_ingest_text_tokens( moshi_lm_gen_t * gen, const int * tokens, int n_tokens, int audio_silence_frames = 1 );
+
 MOSHI_API void moshi_lm_send( moshi_lm_gen_t * gen, Entry * entry );
 MOSHI_API int moshi_lm_receive( moshi_lm_gen_t * gen, int & text_token, std::vector<int16_t> & audio_tokens );
 MOSHI_API void moshi_lm_send2( moshi_lm_gen_t * gen, std::vector<int16_t> & audio_tokens );
