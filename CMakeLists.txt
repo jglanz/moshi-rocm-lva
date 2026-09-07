@@ -55,6 +55,11 @@ include(moshi-sentencepiece)
 
 option(MOSHI_BUILD_TOOLS    "moshi: build tools"          ${MOSHI_STANDALONE})
 
+# OFF by default, and deliberately so: a consumer that pulls this tree in with
+# add_subdirectory(), and the package port that builds it, get no test target and
+# no ctest registration unless they ask for one.
+option(MOSHI_BUILD_TESTS    "moshi: build tests"          OFF)
+
 add_library(moshi src/moshi.cpp src/json.cpp src/safetensor.cpp)
 add_library(moshi::moshi ALIAS moshi)
 
@@ -76,6 +81,11 @@ setup_rpath(moshi)
 
 if (MOSHI_BUILD_TOOLS)
     add_subdirectory(tools)
+endif ()
+
+if (MOSHI_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
 endif ()
 
 # ---------------------------------------------------------------------------
