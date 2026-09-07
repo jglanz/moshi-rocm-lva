@@ -1059,10 +1059,24 @@ bool moshi_lmgen_step(
     // takes effect immediately, exactly as before; routing it here means the forcing
     // rule lives in one place and the injected token reaches the cache the same way
     // every other supplied token does.
+    //
+    // EXCLUSIVE WITH A LIVE SCRIPT, and the slot is drained either way. A provided
+    // token sets provided[target][0], which makes the depformer voice it and the
+    // commit keep it -- while the script's cursor would advance on the token the
+    // constrained choice below picked. That is the one way this mechanism could lie
+    // about what was actually said, so the script wins and the forced token is
+    // consumed and dropped. Draining it unconditionally is what keeps it from
+    // surfacing later, on some unrelated frame after the script ended.
     if ( forced_text_token ) {
         const int forced = forced_text_token->exchange( -1, std::memory_order_acq_rel );
         if ( forced >= 0 ) {
-            moshi_lmgen_provide( state, lm, 0, forced );
+            bool script_live = false;
+            if ( lmgen->script ) {
+                std::lock_guard<std::mutex> lock( lmgen->script->mu );
+                script_live = lmgen->script->machine.constraining();
+            }
+            if ( ! script_live )
+                moshi_lmgen_provide( state, lm, 0, forced );
         }
     }
 
@@ -1140,6 +1154,87 @@ bool moshi_lmgen_step(
     int text_token;
     ggml_backend_tensor_get( lm_states->sampler_out, &text_token, 0, 4 );
 #endif
+
+    // SCRIPTED (CONSTRAINED) TEXT DECODING -- on the host, in this same step, before
+    // anything downstream sees the token.
+    //
+    // The graph's sampler has already run and its token is in `text_token`. When a
+    // script is live that token is replaced by the best-scoring member of the
+    // grammar's ALLOWED SET, scored on the very logits the sampler read: at most
+    // three candidates (the script's next piece, new_word, the padding id), so the
+    // "argmax" is a two- or three-way compare on the host. Everything downstream is
+    // untouched -- the depformer voices this token, the commit records it, and the
+    // tap reads it back one frame later -- so "what was chosen" and "what was said"
+    // remain the same value by construction.
+    //
+    // WHY HERE AND NOT IN THE GRAPH. A bias tensor on the logits would be DEVICE
+    // state that outlives the machine that wrote it: lm_states->gctx survives
+    // moshi_lm_prime, and a resident server reconnecting onto a cached primed state
+    // runs neither prime nor reset, so a mask left behind by a session that ended
+    // mid-script would silently mute the next session. On the host there is nothing
+    // to leak: the graph is byte-identical for every generator, the exported logits
+    // are never modified, and the read happens only while a script is live.
+    //
+    // WHY NOT THE INJECTION SLOT. Forcing a token per frame makes the CALLER own
+    // the pacing, and it is one frame stale by the time any observer could react.
+    // Here the model's own logits decide between the candidates every frame; only
+    // the candidate set is ours.
+    //
+    // The lock covers the whole decision: the choice and the machine update happen
+    // in one critical section on this thread, so a caller setting or clearing a
+    // script from another thread lands strictly before or after a step.
+    if ( lmgen->script && lm_states->text_logits_out ) {
+        moshi_script_slot_t & script = *lmgen->script;
+        std::lock_guard<std::mutex> lock( script.mu );
+        if ( script.machine.constraining() ) {
+            const TokenIds ids( lm->text_card, lm->text_padding_token_id );
+            const moshi_script::Allowed allowed =
+                script.machine.allowed( script.word_start.data(), script.options );
+
+            // The same F32 [text_card] row the sampler read, on the synchronisation
+            // the sampler_out readout above has already forced.
+            ggml_tensor * logits = lm_states->text_logits_out;
+            const int n_logits = (int) ggml_nelements( logits );
+            script.logits_host.resize( (size_t) n_logits );
+            ggml_backend_tensor_get( logits, script.logits_host.data(), 0,
+                                     ggml_nbytes( logits ) );
+
+            // Ties break in the order the candidates are offered -- the script's
+            // piece, then new_word, then padding -- because the first one considered
+            // keeps the slot on an exact tie.
+            int   best = -1;
+            float best_logit = 0.f;
+            auto consider = [&]( int token ) {
+                if ( token < 0 || token >= n_logits )
+                    return;
+                const float logit = script.logits_host[token];
+                if ( best < 0 || logit > best_logit ) {
+                    best = token;
+                    best_logit = logit;
+                }
+            };
+            if ( allowed.piece && script.machine.cursor < (int) script.tokens.size() )
+                consider( script.tokens[script.machine.cursor] );
+            if ( allowed.new_word )
+                consider( ids.new_word );
+            if ( allowed.pad )
+                consider( ids.pad );
+
+            if ( best >= 0 ) {
+                text_token = best;
+                // Cannot return false -- the choice was made FROM the allowed set --
+                // which is exactly why counting the false returns is the proof the
+                // mechanism ran. Never clamped, never discarded.
+                if ( ! script.machine.advance( text_token, ids.pad, ids.new_word,
+                                               script.tokens.data(),
+                                               script.word_start.data(),
+                                               script.options ) ) {
+                    ++script.violations;
+                    ++script.violations_total;
+                }
+            }
+        }
+    }
 
     // The SAMPLED token, kept separate from the one this step conditions on: the
     // cache records what the model produced, the depformer consumes what was
