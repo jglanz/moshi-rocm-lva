@@ -318,6 +318,110 @@ MOSHI_API void moshi_lm_personaplex_clear_forced_text_token( moshi_lm_gen_t * ge
 // The armed-but-not-yet-consumed token, or -1.
 MOSHI_API int moshi_lm_personaplex_pending_forced_text_token( moshi_lm_gen_t * gen );
 
+// MARK: Scripted text decoding
+//
+// WHAT IT IS. A caller that already knows what the model should SAY -- an answer
+// it fetched, a line it must deliver -- hands the answer over as text token ids,
+// and the model says exactly those tokens, in its own voice, on its own timing.
+// The step samples the text stream exactly as it always did; the only difference
+// is that while a script is live the token it ends up with is the best-scoring
+// member of a SMALL ALLOWED SET rather than of the whole vocabulary. That set is
+// at most three candidates: hold (the text padding id), start the next chunk
+// (new_word), or emit the script's next piece. The grammar that produces it, and
+// the recorded generation the grammar was derived from, are in
+// <moshi/script_grammar.h>.
+//
+// WHY A CANDIDATE SET AND NOT A FORCED TOKEN. The injection slot above supplies
+// THE token for a frame, which means the caller owns the pacing -- when each word
+// starts, how long it is held, where the pauses fall -- and the model then voices
+// a rhythm that came from the caller's clock. Constraining the set instead leaves
+// every one of those decisions with the model, which still chooses on every frame
+// between holding, starting a chunk and emitting the next piece, and takes only
+// the CONTENT of the piece. The two mechanisms are mutually exclusive by
+// construction: while a script is live an armed forced token is drained and
+// discarded, because a forced token is voiced and committed as-is while the
+// script's cursor would advance on the token the model chose -- the one way this
+// could lie about what was actually said.
+//
+// TOKEN IDS ONLY, like the text-prompt entry point above: no strings, no
+// tokenizer, no configuration, and no notion of what the script means.
+// `word_start[i]` marks the pieces that BEGIN a word (for a SentencePiece
+// tokenizer, the pieces carrying the word-start marker); index 0 counts as a word
+// start whatever the array says. Those flags are what let the model pause between
+// words and hold a word as long as it likes while keeping the pieces of one word
+// consecutive -- the model's own shape -- so they are required, not optional.
+//
+// TEMPERATURE. The choice among the allowed candidates is made on the host from
+// the text logits the graph already exports, and that is exact only where the
+// graph's own sampler is a pure argmax: at text temperature 0, which is what
+// every personaplex generator uses. moshi_lm_script_set REFUSES with -4 on a
+// generator whose text temperature is non-zero, rather than quietly deciding
+// differently from the sampler it stands in for.
+//
+// NO DEVICE STATE AND NO GRAPH CHANGE. Nothing here adds a node, a tensor or a
+// bias; the compute graph is byte-identical whether a script is live or not, and
+// a generator that never sets one runs exactly the code it ran before. A live
+// script is dropped -- the machine back to none, the epoch untouched -- by
+// moshi_lm_prime, moshi_lm_reset, moshi_lm_snapshot_restore and
+// moshi_lm_personaplex_ingest_text_tokens, each of which puts the generator on a
+// different footing from the one the cursor was walking.
+
+struct moshi_lm_script_options_t {
+    // Longest run of padding frames allowed before the set collapses to
+    // {new_word}: the guarantee that an armed script eventually starts and
+    // eventually finishes, since a model told to stay quiet will otherwise choose
+    // padding forever. <= 0 disables it, which is only safe for a caller that has
+    // its own way out. A capped step is a step whose timing the CALLER chose, not
+    // the model, which is what moshi_lm_script_progress_t::stalls_capped reports.
+    int max_pad_frames_between_chunks;
+    // What happens once the last script token has been chosen:
+    //   0  wait for the model's own new_word -- its "that word is finished"
+    //      signal, and the only one this stream has (there is no end-of-text
+    //      token on the monologue).
+    //   1  a bounded tail of exactly `after_script_frames` padding frames.
+    //   2  lift the constraint and leave the generator free; the machine never
+    //      reaches its done state and the caller decides when the cue is over.
+    int after_script;
+    int after_script_frames;   // for after_script == 1
+};
+
+struct moshi_lm_script_progress_t {
+    int n_tokens, cursor;          // cursor == n_tokens once every token was chosen
+    int state;                     // moshi_script::State (none, armed, awaiting_piece,
+                                   //   in_chunk, between, after_script, free, done)
+    int script_epoch;              // which script this describes; 0 when there is none.
+                                   //   Epochs start at 1 and are monotonic per generator
+                                   //   -- never reset by a clear, a prime or a restore --
+                                   //   so a stale read can never match a newer script.
+    int steps_since_arm;           // -1 until armed
+    int steps_since_first_word;    // -1 until the first content token was chosen
+    int pads_since_chunk;          // length of the CURRENT padding run
+    int chunks_started;            // transitions into awaiting_piece, i.e. new_words
+    int stalls_capped;             // steps on which the cap collapsed the set
+    int violations;                // out-of-set choices for the CURRENT script
+    int violations_total;          // monotonic per generator: the run-level counter
+};
+
+// Arm a script. Returns its epoch (>= 1) on success; errors are <= 0:
+//   -1  unusable generator
+//   -2  not a personaplex generator (the state-machine / text-to-speech path owns
+//       its own text stream)
+//   -3  a token outside [0, text_card), a NULL or empty `tokens`, or a NULL
+//       `word_start` -- "only index 0 begins a word" would force the whole answer
+//       out as one unbroken run of content frames, which is well defined and
+//       wrong, so it is refused rather than guessed
+//   -4  the generator samples text at a non-zero temperature (see above)
+// `options` may be NULL, which takes the defaults. Any armed forced token is
+// cleared. The script is live from the next step.
+MOSHI_API int  moshi_lm_script_set     ( moshi_lm_gen_t * gen, const int * tokens,
+                                         const char * word_start, int n_tokens,
+                                         const moshi_lm_script_options_t * options );
+// Drop the script. The generator decodes freely again from the next step; the
+// epoch and violations_total are left alone.
+MOSHI_API void moshi_lm_script_clear   ( moshi_lm_gen_t * gen );
+// 0 ok; -1 unusable. One mutex, no device access.
+MOSHI_API int  moshi_lm_script_progress( moshi_lm_gen_t * gen, moshi_lm_script_progress_t * out );
+
 // MARK: Mid-conversation context ingest
 //
 // WHAT IT IS. The system-prompt phase's text stepper

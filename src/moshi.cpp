@@ -825,6 +825,21 @@ struct moshi_lm_gen_t {
     moshi_script_slot_t script;
 };
 
+// Drop any live script. Called wherever the generator's footing changes under one:
+// after that, a cursor mid-answer describes a conversation that no longer exists.
+//
+// THE EPOCH IS DELIBERATELY NOT TOUCHED. It is monotonic for the life of the
+// generator, so a progress read taken across a clear can never be mistaken for a
+// report about the next script. Neither is violations_total, which is the
+// run-level counter and would lose its meaning if a clear could reset it.
+static void moshi_lm_script_drop( moshi_lm_gen_t * gen ) {
+    std::lock_guard<std::mutex> lock( gen->script.mu );
+    gen->script.machine.clear();
+    gen->script.tokens.clear();
+    gen->script.word_start.clear();
+    gen->script.violations = 0;
+}
+
 moshi_lm_gen_t * moshi_lm_generator( moshi_lm_t * lm ) {
     auto gen = new moshi_lm_gen_t;
     gen->lm = lm;
@@ -1076,6 +1091,8 @@ void moshi_lm_prime( moshi_context_t * moshi, moshi_lm_gen_t * gen, int audio_si
         ( gen->voice && ! gen->lm->model->personaplex ) ? gen->voice->cross : NULL;
 
     gen->personaplex_forced_text_token.store( -1, std::memory_order_release );
+    // The conversation this script was written into is over.
+    moshi_lm_script_drop( gen );
     moshi_lmgen_state_seed( gen->lmgen_state, gen->lm->model );
     gen->state_ctx->init();
     init( moshi->scratch, gen->lm_states, gen->lm->model, condition_cross );
@@ -1211,6 +1228,10 @@ int moshi_lm_snapshot_restore( moshi_lm_gen_t * gen, moshi_lm_snapshot_t * snaps
         gen->lm_states->depformer->offset = 0;   // see the comment on the struct
     *gen->lmgen_state = snapshot->lmgen;
     gen->personaplex_forced_text_token.store( -1, std::memory_order_release );
+    // The generator now holds a DIFFERENT conversation's state, so a cursor part
+    // way through an answer belongs to nothing. This is the path a resident server
+    // takes on a cached reconnect, where neither prime nor reset runs.
+    moshi_lm_script_drop( gen );
     return 0;
 }
 
@@ -1236,6 +1257,93 @@ int moshi_lm_personaplex_pending_forced_text_token( moshi_lm_gen_t * gen ) {
     return gen->personaplex_forced_text_token.load( std::memory_order_acquire );
 }
 
+// MARK: Scripted text decoding
+//
+// The header carries the contract. What is worth saying here is what these three
+// functions do NOT do: they touch no tensor, build no graph and allocate no device
+// memory. Everything they own is host state on the generator, and the decoder
+// reads it inside the step under the same lock.
+
+int moshi_lm_script_set( moshi_lm_gen_t * gen, const int * tokens, const char * word_start,
+                         int n_tokens, const moshi_lm_script_options_t * options ) {
+    // Everything moshi_lm_start builds, because a script only means anything to a
+    // generator that can step.
+    if ( ! gen || ! gen->ctx || ! gen->lmgen_state || ! gen->lm_states || ! gen->state_ctx )
+        return -1;
+    if ( ! gen->lm || ! gen->lm->model )
+        return -1;
+    // The state-machine (text-to-speech) path owns its own text stream -- it
+    // rewrites the sampled token itself -- so a second owner is refused rather
+    // than silently losing to it. Same refusal shape as the snapshot entry points.
+    if ( gen->machine || ! gen->lm->model->personaplex || ! gen->lmgen.script )
+        return -2;
+    // The host-side choice among the allowed candidates reproduces the graph's own
+    // sampler exactly only where that sampler is a pure argmax.
+    if ( gen->lmgen.temp_text != 0.f )
+        return -4;
+    if ( ! tokens || n_tokens <= 0 )
+        return -3;
+    // "Only index 0 begins a word" is well defined and wrong: it would force the
+    // whole answer out as one unbroken run of content frames. The caller has the
+    // flags; it must supply them.
+    if ( ! word_start )
+        return -3;
+    const int text_card = gen->lm->model->text_card;
+    for ( int i = 0; i < n_tokens; i++ ) {
+        if ( tokens[i] < 0 || tokens[i] >= text_card )
+            return -3;
+    }
+
+    moshi_script::Options opts;
+    if ( options ) {
+        if ( options->after_script < (int) moshi_script::AfterScript::wait_for_new_word
+          || options->after_script > (int) moshi_script::AfterScript::free )
+            return -3;
+        opts.max_pad_frames_between_chunks = options->max_pad_frames_between_chunks;
+        opts.after_script       = (moshi_script::AfterScript) options->after_script;
+        opts.after_script_frames = options->after_script_frames;
+    }
+
+    // A forced token and a script are two answers to "what is said on the next
+    // frame". The step drains the slot either way; arming a script here makes the
+    // exclusion explicit at the point the caller can still see it.
+    gen->personaplex_forced_text_token.store( -1, std::memory_order_release );
+
+    std::lock_guard<std::mutex> lock( gen->script.mu );
+    gen->script.tokens.assign( tokens, tokens + n_tokens );
+    gen->script.word_start.assign( word_start, word_start + n_tokens );
+    gen->script.options = opts;
+    gen->script.machine.arm( n_tokens );
+    gen->script.violations = 0;
+    ++gen->script.epoch;   // 0 before the first script, so epochs start at 1
+    return gen->script.epoch;
+}
+
+void moshi_lm_script_clear( moshi_lm_gen_t * gen ) {
+    if ( ! gen )
+        return;
+    moshi_lm_script_drop( gen );
+}
+
+int moshi_lm_script_progress( moshi_lm_gen_t * gen, moshi_lm_script_progress_t * out ) {
+    if ( ! gen || ! out )
+        return -1;
+    std::lock_guard<std::mutex> lock( gen->script.mu );
+    const moshi_script::Machine & m = gen->script.machine;
+    out->n_tokens              = m.n;
+    out->cursor                = m.cursor;
+    out->state                 = (int) m.state;
+    out->script_epoch          = m.state == moshi_script::State::none ? 0 : gen->script.epoch;
+    out->steps_since_arm       = m.steps_since_arm;
+    out->steps_since_first_word = m.steps_since_first_word;
+    out->pads_since_chunk      = m.pads_since_chunk;
+    out->chunks_started        = m.chunks_started;
+    out->stalls_capped         = m.stalls_capped;
+    out->violations            = gen->script.violations;
+    out->violations_total      = gen->script.violations_total;
+    return 0;
+}
+
 int moshi_lm_personaplex_ingest_text_tokens( moshi_lm_gen_t * gen, const int * tokens, int n_tokens, int audio_silence_frames ) {
     // Everything moshi_lm_start builds, because the stepper reads all of it.
     if ( ! gen || ! gen->ctx || ! gen->lmgen_state || ! gen->lm_states || ! gen->state_ctx )
@@ -1255,6 +1363,10 @@ int moshi_lm_personaplex_ingest_text_tokens( moshi_lm_gen_t * gen, const int * t
     // ingest step swallow it. Clearing is the honest resolution -- the caller that
     // armed it is the caller asking for the ingest.
     gen->personaplex_forced_text_token.store( -1, std::memory_order_release );
+    // Same reasoning for a live script, and one more: these steps run off the
+    // conversation's frame clock, so a cursor carried across them would describe
+    // progress that no frame ever carried.
+    moshi_lm_script_drop( gen );
 
     std::vector<int> ids( tokens, tokens + n_tokens );
     // The same three-phase shape moshi_lmgen_step_system_prompts uses, minus the
