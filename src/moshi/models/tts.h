@@ -349,7 +349,9 @@ void moshi_ttsmodel_generate_wav(
         true, 0.6f, 0.6f, 250, 25,
         machine, machine_state,
         tts->voice.sum,
-        &tts->voice.text_prefixes, &tts->voice.audio_prefixes
+        &tts->voice.text_prefixes, &tts->voice.audio_prefixes,
+        NULL, // no injection on the state-machine (TTS) path
+        NULL  // and no scripted decoding either: the state machine owns the text
     };
 
     ScratchContext ctx( 256, backend );

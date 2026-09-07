@@ -818,6 +818,11 @@ struct moshi_lm_gen_t {
     // consumed on the inference thread. NSDMI because moshi_lm_generator
     // default-initializes.
     std::atomic<int> personaplex_forced_text_token{-1};
+
+    // Scripted (constrained) text decoding, handed to moshi_lmgen_t on the
+    // personaplex path. Always present and empty until a script is set: it holds no
+    // device memory and the step skips its branch while no script is live.
+    moshi_script_slot_t script;
 };
 
 moshi_lm_gen_t * moshi_lm_generator( moshi_lm_t * lm ) {
@@ -1011,7 +1016,8 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
             gen->machine, gen->machine_state,
             gen->voice->sum,
             &gen->voice->text_prefixes, &gen->voice->audio_prefixes,
-            NULL // no injection on the state-machine (TTS) path
+            NULL, // no injection on the state-machine (TTS) path
+            NULL  // and no scripted decoding either: the state machine owns the text
         };
         gen->lm_states = moshi_lmmodel_states( gen->state_ctx, gen->lm->model, gen->voice->cross );
     } else {
@@ -1022,6 +1028,7 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
             NULL, // no cross
             NULL, NULL, // empty prefixes
             &gen->personaplex_forced_text_token,
+            &gen->script,
         };
         gen->personaplex_forced_text_token.store( -1, std::memory_order_release );
         gen->lm_states = moshi_lmmodel_states( gen->state_ctx, gen->lm->model, NULL );

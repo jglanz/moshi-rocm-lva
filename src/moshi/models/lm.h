@@ -2,6 +2,10 @@
 
 #include <atomic>
 #include <deque>
+#include <mutex>
+#include <vector>
+
+#include <moshi/script_grammar.h>
 
 // The padding id every caller fell back on before it was read from the model
 // config. Kept as the fallback for configs that omit `existing_text_padding_id`,
@@ -933,6 +937,43 @@ inline void moshi_lmgen_commit( moshi_lmgen_state_t * state, moshi_lmmodel_t * l
     state->offset++;
 }
 
+// Everything one generator needs to decode a script, and nothing else: no device
+// memory, no graph node, no tensor. The decoder reads the text logits it already
+// exports, asks the machine which candidates are legal on this step, picks the
+// best of them by those logits and reports the choice back -- all on the host,
+// inside the step, so the compute graph is byte-identical whether a script is live
+// or not.
+//
+// THE LOCK covers one whole step's use of this slot. The choice and the machine
+// update happen in the same critical section on the inference thread, so a caller
+// setting or clearing a script from another thread can only land BEFORE or AFTER a
+// step, never inside one.
+struct moshi_script_slot_t {
+    std::mutex mu;
+
+    // The script: token ids the caller produced, and its flags marking the pieces
+    // that begin a word (index 0 is a word start by definition).
+    std::vector<int>  tokens;
+    std::vector<char> word_start;
+
+    moshi_script::Options options;
+    moshi_script::Machine machine;
+
+    // Which script the machine is walking. Monotonic per generator and never reset
+    // -- not by clearing, not by priming, not by a snapshot restore -- so a stale
+    // progress read can never be mistaken for a report about a newer script.
+    int epoch = 0;
+
+    // Out-of-set choices. `violations` describes the CURRENT script; the total is
+    // monotonic per generator, so a script that ends between two progress reads
+    // cannot drop a count. Neither is ever clamped.
+    int violations = 0;
+    int violations_total = 0;
+
+    // Reusable host buffer for the per-step logits read. Sized once, on first use.
+    std::vector<float> logits_host;
+};
+
 struct moshi_lmgen_t {
     moshi_lmmodel_t * lm;
     bool use_sampling;
@@ -961,6 +1002,13 @@ struct moshi_lmgen_t {
     // inference thread. A plain int there is a data race, and the arm-then-consume
     // handshake is exactly the shape that loses a token when it tears.
     std::atomic<int> * forced_text_token;
+
+    // Scripted (constrained) text decoding. Points at the slot the generator owns;
+    // NULL disables the mechanism entirely, which is what every non-personaplex
+    // caller gets and what keeps the state-machine (TTS) path untouched. A slot
+    // whose machine holds no live script costs nothing either: the step's branch is
+    // skipped and the graph's own sampled token stands.
+    moshi_script_slot_t * script;
 };
 
 bool moshi_lmgen_step(
