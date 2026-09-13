@@ -1131,7 +1131,7 @@ bool moshi_lmgen_step(
         // Keep the logits as a graph output too. They are already computed -- the
         // sampler reads them -- so this materialises an existing value rather than
         // adding arithmetic, and the token streams are bit-identical with and
-        // without it (verified: the dumps used to derive the M3 parity margins
+        // without it (verified: the dumps used to derive the parity-oracle margins
         // produced the same 64 ids as the runs without them).
         lm_states->text_logits_out = text_logits;
         graph.build_forward_expand( text_logits );

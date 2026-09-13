@@ -1138,7 +1138,7 @@ struct moshi_streaming_transformer_state_t {
     // reset, ~40 such steps ran over freshly zeroed KV with a stale embedding and
     // poisoned the prompt context.
     //
-    // Symptom that led here: `m3-parity --twice` decoded 64 real ids on the first
+    // Symptom that led here: the parity oracle run twice on one session decoded 64 real ids on the first
     // pass and a constant token on the second; a silence-only control produced no
     // tokens at all on pass 1 (correct -- the model waits for a turn) and 32
     // constant tokens on pass 2.
